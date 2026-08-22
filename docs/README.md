@@ -18,7 +18,12 @@ Accepted ADRs are historical records. If a decision changes, add a new ADR and l
 
 Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 
+## Technical notes
+
+- [Benchmarks](benchmarks.md)
+
 ## ADR index
 
 - [0001: Record architecture decisions](adrs/0001-record-architecture-decisions.md) — Accepted
 - [0002: Build a local knowledge base on Ard and SQLite](adrs/0002-build-local-knowledge-base-on-ard-and-sqlite.md) — Accepted
+- [0003: Use modernc SQLite for core storage](adrs/0003-use-modernc-sqlite-for-core-storage.md) — Accepted

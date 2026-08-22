@@ -1,0 +1,125 @@
+use ard/testing
+
+use go:fmt
+use go:kb/ffi/sqlite
+use go:os
+
+fn documents() [sqlite::Document] {
+  [
+    sqlite::Document{
+      Path: "notes/sqlite.md",
+      Title: "SQLite migrations",
+      Body: "Apply schema migrations inside a transaction.",
+    },
+    sqlite::Document{
+      Path: "notes/search.md",
+      Title: "Search",
+      Body: "SQLite FTS5 provides full-text search.",
+    },
+    sqlite::Document{
+      Path: "notes/ard.md",
+      Title: "Ard",
+      Body: "Ard compiles programs to Go.",
+    },
+  ]
+}
+
+fn ensure_fts5(enabled: Bool) Void!Error {
+  match enabled {
+    true => Result::ok(()),
+    false => Result::err(Error::new("SQLite build does not include FTS5")),
+  }
+}
+
+fn run() Void!Error {
+  let db = try sqlite::Open(":memory:")
+  defer db.Close()
+  
+  let enabled = try db.FTS5Enabled()
+  try ensure_fts5(enabled)
+  
+  try db.CreateIndex()
+  let docs: mut [sqlite::Document] = mut documents()
+  try db.InsertDocuments(docs)
+  let results = try db.Search("sqlite migrations", 10)
+  
+  for result in results {
+    fmt::Printf("%.6f  %s  %s\n", result.Rank, result.Path, result.Title)
+  }
+  try db.Close()
+  Result::ok(())
+}
+
+fn main() {
+  try run() -> err {
+    fmt::Println("Error: {err.error()}")
+    os::Exit(1)
+  }
+}
+
+test fn searches_an_fts5_index() Void!Str {
+  let db = try sqlite::Open(
+    ":memory:",
+  ).map_err(fn(err: Error) Str {
+    err.error()
+  })
+  defer db.Close()
+  
+  let enabled = try db.FTS5Enabled().map_err(fn(err: Error) Str {
+    err.error()
+  })
+  try testing::assert(enabled, "expected SQLite to include FTS5")
+  try db.CreateIndex().map_err(fn(err: Error) Str {
+    err.error()
+  })
+  let docs: mut [sqlite::Document] = mut documents()
+  try db.InsertDocuments(
+    docs,
+  ).map_err(fn(err: Error) Str {
+    err.error()
+  })
+  
+  let results = try db.Search(
+    "sqlite migrations",
+    10,
+  ).map_err(fn(err: Error) Str {
+    err.error()
+  })
+  try testing::assert(results.size() > 0, "expected a search result")
+  try testing::assert(
+    results.at(
+      0,
+    ).map(fn(result: sqlite::SearchResult) Str {
+      result.Path
+    }).or("") == "notes/sqlite.md",
+    "expected migration document first",
+  )
+  try testing::assert(
+    results.at(
+      0,
+    ).map(fn(result: sqlite::SearchResult) Str {
+      result.Title
+    }).or("") == "SQLite migrations",
+    "expected a typed title",
+  )
+  try testing::assert(
+    results.at(
+      0,
+    ).map(fn(result: sqlite::SearchResult) Int {
+      result.ID
+    }).or(0) == 1,
+    "expected a typed row ID",
+  )
+  try testing::assert(
+    results.at(
+      0,
+    ).map(fn(result: sqlite::SearchResult) Float64 {
+      result.Rank
+    }).or(0.0) < 0.0,
+    "expected a typed BM25 rank",
+  )
+  try db.Close().map_err(fn(err: Error) Str {
+    err.error()
+  })
+  testing::pass()
+}
