@@ -1,0 +1,7 @@
+fn name() Str {
+  "kb"
+}
+
+fn description() Str {
+  "A fast local knowledge base"
+}

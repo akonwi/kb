@@ -1,0 +1,6 @@
+use go:fmt
+use kb/app
+
+fn main() {
+  fmt::Println("{app::name()}: {app::description()}")
+}
