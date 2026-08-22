@@ -13,6 +13,8 @@ import (
 	"sync"
 
 	"github.com/bmatcuk/doublestar/v4"
+
+	"kb/ffi/markdown"
 )
 
 // Entry is filesystem metadata collected without opening a document body.
@@ -64,6 +66,11 @@ type ReadResult struct {
 	SearchableText string
 	SizeBytes      int
 	MtimeNS        int
+}
+
+// MarkdownExtractionVersion identifies the current derived-text semantics.
+func MarkdownExtractionVersion() int {
+	return markdown.Version
 }
 
 // CanonicalDirectory resolves a directory to an absolute symlink-free path.
@@ -126,6 +133,25 @@ func ignoredPath(relative string, ignores []string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// Inspect returns current metadata for one relative path under the pinned root.
+func (scanner *Scanner) Inspect(relativePath string) (Entry, error) {
+	relativePath = filepath.ToSlash(relativePath)
+	info, err := scanner.root.Stat(filepath.FromSlash(relativePath))
+	if err != nil {
+		return Entry{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return Entry{}, fmt.Errorf("%q is not a regular file", relativePath)
+	}
+	return Entry{
+		RootPath:     scanner.rootPath,
+		RelativePath: relativePath,
+		AbsolutePath: filepath.Join(scanner.rootPath, filepath.FromSlash(relativePath)),
+		SizeBytes:    int(info.Size()),
+		MtimeNS:      int(info.ModTime().UnixNano()),
+	}, nil
 }
 
 // Walk emits matching regular files as they are discovered. The caller owns
@@ -218,13 +244,14 @@ func (scanner *Scanner) ReadAndHash(entry Entry) (ReadResult, error) {
 	}
 
 	sum := sha256.Sum256(body)
-	markdown := string(body)
+	source := string(body)
+	extracted := markdown.Parse(source, entry.RelativePath)
 	return ReadResult{
 		RelativePath:   entry.RelativePath,
-		Title:          strings.TrimSuffix(filepath.Base(entry.RelativePath), filepath.Ext(entry.RelativePath)),
+		Title:          extracted.Title,
 		Hash:           hex.EncodeToString(sum[:]),
-		Markdown:       markdown,
-		SearchableText: markdown,
+		Markdown:       source,
+		SearchableText: extracted.SearchableText,
 		SizeBytes:      entry.SizeBytes,
 		MtimeNS:        entry.MtimeNS,
 	}, nil

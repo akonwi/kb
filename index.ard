@@ -154,6 +154,7 @@ fn start_reader(
                     SizeBytes: read.SizeBytes,
                     MtimeNS: read.MtimeNS,
                     HasContent: true,
+                    ExtractionVersion: fs::MarkdownExtractionVersion(),
                   },
                   reserved_bytes: job.reserved_bytes,
                 },
@@ -329,7 +330,7 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
         walked =+ 1
         let should_read = match metadata.get(entry.RelativePath) {
           existing => {
-            options.verify or existing.SizeBytes != entry.SizeBytes or existing.MtimeNS != entry.MtimeNS
+            options.verify or existing.SizeBytes != entry.SizeBytes or existing.MtimeNS != entry.MtimeNS or existing.ExtractionVersion != fs::MarkdownExtractionVersion()
           },
           _ => true,
         }
@@ -363,6 +364,7 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
                 SizeBytes: entry.SizeBytes,
                 MtimeNS: entry.MtimeNS,
                 HasContent: false,
+                ExtractionVersion: 0,
               },
               reserved_bytes: 0,
             },
@@ -417,6 +419,87 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
 
 private fn error_message(error: Error) Str {
   error.error()
+}
+
+test fn extraction_version_refreshes_unchanged_documents() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-extraction-version-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-extraction-version-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  let source = "# Current title\n\nvisible extracted text"
+  try os::WriteFile("{root}/legacy.md", mut source.bytes(), 420).map_err(error_message)
+  let scanner = try fs::OpenScanner(root).map_err(error_message)
+  let entry = try scanner.Inspect("legacy.md").map_err(error_message)
+  try scanner.Close().map_err(error_message)
+  // Seed a document using the pre-versioned extraction state.
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let _ = try database.add_document(
+    collection.ID,
+    "legacy.md",
+    "Legacy title",
+    "legacy-hash",
+    source,
+    "raw_marker_from_old_extractor",
+    entry.SizeBytes,
+    entry.MtimeNS,
+  ).map_err(error_message)
+  // A normal metadata-stable update must still refresh derived text.
+  let refreshed = try update(database, collection, default_options()).map_err(error_message)
+  try testing::assert(
+    refreshed.read == 1 and refreshed.updated == 1,
+    "old extraction version must force refresh",
+  )
+  try testing::assert(
+    (try database.db.Search("raw_marker_from_old_extractor", 10).map_err(error_message)).size() == 0,
+    "stale extracted text must leave FTS",
+  )
+  try testing::assert(
+    (try database.db.Search("visible extracted", 10).map_err(error_message)).size() == 1,
+    "current extracted text must enter FTS",
+  )
+  testing::pass()
+}
+
+test fn markdown_extraction_preserves_source_and_indexes_visible_text() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-markdown-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-markdown-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  let source = "---\nprivate_token: should_not_be_searchable\n---\n# Visible title\n\nFind the [public label](https://private.example) and `code_token`."
+  try os::WriteFile("{root}/document.md", mut source.bytes(), 420).map_err(error_message)
+  // Index through the complete reader and writer pipeline.
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let indexed = try update(database, collection, default_options()).map_err(error_message)
+  try testing::assert(indexed.inserted == 1, "expected Markdown document indexing")
+  // Retrieval must retain source while FTS receives only derived text.
+  let content = try database.db.LookupDocumentContent(collection.ID, "document.md").map_err(error_message)
+  try testing::assert(
+    content.Found and content.Markdown == source,
+    "original Markdown must remain unchanged",
+  )
+  try testing::assert(
+    not content.SearchableText.contains("private_token"),
+    "frontmatter must not be searchable",
+  )
+  try testing::assert(
+    not content.SearchableText.contains("private.example"),
+    "link destination must not be searchable",
+  )
+  try testing::assert(
+    (try database.db.Search("public label", 10).map_err(error_message)).size() == 1,
+    "visible link label must be searchable",
+  )
+  try testing::assert(
+    (try database.db.Search("code_token", 10).map_err(error_message)).size() == 1,
+    "inline code must be searchable",
+  )
+  testing::pass()
 }
 
 test fn incremental_update_skips_unchanged_and_removes_stale_documents() Void!Str {

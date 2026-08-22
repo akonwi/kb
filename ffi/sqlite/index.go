@@ -8,25 +8,27 @@ import (
 
 // DocumentMetadata supports no-read change detection during a filesystem scan.
 type DocumentMetadata struct {
-	ID           int
-	RelativePath string
-	ContentHash  string
-	Title        string
-	SizeBytes    int
-	MtimeNS      int
-	Active       bool
+	ID                int
+	RelativePath      string
+	ContentHash       string
+	Title             string
+	SizeBytes         int
+	MtimeNS           int
+	Active            bool
+	ExtractionVersion int
 }
 
 // IndexChange is one filesystem observation sent to the SQLite writer.
 type IndexChange struct {
-	RelativePath   string
-	Title          string
-	ContentHash    string
-	Markdown       string
-	SearchableText string
-	SizeBytes      int
-	MtimeNS        int
-	HasContent     bool
+	RelativePath      string
+	Title             string
+	ContentHash       string
+	Markdown          string
+	SearchableText    string
+	SizeBytes         int
+	MtimeNS           int
+	HasContent        bool
+	ExtractionVersion int
 }
 
 // BatchStats describes one committed indexing batch.
@@ -36,13 +38,22 @@ type BatchStats struct {
 	Seen     int
 }
 
+// ContentLookup returns original and derived content without nullable pointers.
+type ContentLookup struct {
+	Found          bool
+	Markdown       string
+	SearchableText string
+}
+
 // ListDocumentMetadata returns all known paths, including inactive documents
 // that may reappear.
 func (db *DB) ListDocumentMetadata(collectionID int) ([]DocumentMetadata, error) {
 	rows, err := db.conn.QueryContext(context.Background(), `
-		SELECT id, relative_path, content_hash, title, size_bytes, mtime_ns, active
-		FROM documents
-		WHERE collection_id = ?
+		SELECT d.id, d.relative_path, d.content_hash, d.title, d.size_bytes, d.mtime_ns, d.active,
+		       content.extraction_version
+		FROM documents d
+		JOIN content ON content.hash = d.content_hash
+		WHERE d.collection_id = ?
 		ORDER BY relative_path
 	`, collectionID)
 	if err != nil {
@@ -61,12 +72,32 @@ func (db *DB) ListDocumentMetadata(collectionID int) ([]DocumentMetadata, error)
 			&item.SizeBytes,
 			&item.MtimeNS,
 			&item.Active,
+			&item.ExtractionVersion,
 		); err != nil {
 			return nil, err
 		}
 		metadata = append(metadata, item)
 	}
 	return metadata, rows.Err()
+}
+
+// LookupDocumentContent returns stored source and derived text for an active path.
+func (db *DB) LookupDocumentContent(collectionID int, relativePath string) (ContentLookup, error) {
+	var content ContentLookup
+	err := db.conn.QueryRowContext(context.Background(), `
+		SELECT content.markdown, content.searchable_text
+		FROM documents
+		JOIN content ON content.hash = documents.content_hash
+		WHERE documents.collection_id = ? AND documents.relative_path = ? AND documents.active = 1
+	`, collectionID, relativePath).Scan(&content.Markdown, &content.SearchableText)
+	if err == sql.ErrNoRows {
+		return ContentLookup{}, nil
+	}
+	if err != nil {
+		return ContentLookup{}, err
+	}
+	content.Found = true
+	return content, nil
 }
 
 // BeginUpdate advances and returns the generation owned by a new scan.
@@ -112,9 +143,11 @@ func (db *DB) ApplyIndexBatch(collectionID, generation int, changes []IndexChang
 	for _, change := range changes {
 		var existing DocumentMetadata
 		err := tx.QueryRow(`
-			SELECT id, relative_path, content_hash, title, size_bytes, mtime_ns, active
-			FROM documents
-			WHERE collection_id = ? AND relative_path = ?
+			SELECT d.id, d.relative_path, d.content_hash, d.title, d.size_bytes, d.mtime_ns, d.active,
+			       content.extraction_version
+			FROM documents d
+			JOIN content ON content.hash = d.content_hash
+			WHERE d.collection_id = ? AND d.relative_path = ?
 		`, collectionID, change.RelativePath).Scan(
 			&existing.ID,
 			&existing.RelativePath,
@@ -123,6 +156,7 @@ func (db *DB) ApplyIndexBatch(collectionID, generation int, changes []IndexChang
 			&existing.SizeBytes,
 			&existing.MtimeNS,
 			&existing.Active,
+			&existing.ExtractionVersion,
 		)
 		exists := err == nil
 		if err != nil && err != sql.ErrNoRows {
@@ -158,16 +192,20 @@ func (db *DB) ApplyIndexBatch(collectionID, generation int, changes []IndexChang
 		}
 
 		if _, err := tx.Exec(`
-			INSERT INTO content(hash, markdown, searchable_text)
-			VALUES (?, ?, ?)
-			ON CONFLICT(hash) DO NOTHING
-		`, change.ContentHash, change.Markdown, change.SearchableText); err != nil {
+			INSERT INTO content(hash, markdown, searchable_text, extraction_version)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(hash) DO UPDATE SET
+				searchable_text = excluded.searchable_text,
+				extraction_version = excluded.extraction_version
+			WHERE excluded.extraction_version > content.extraction_version
+		`, change.ContentHash, change.Markdown, change.SearchableText, change.ExtractionVersion); err != nil {
 			return BatchStats{}, err
 		}
 
 		if exists && existing.Active &&
 			existing.ContentHash == change.ContentHash && existing.Title == change.Title &&
-			existing.SizeBytes == change.SizeBytes && existing.MtimeNS == change.MtimeNS {
+			existing.SizeBytes == change.SizeBytes && existing.MtimeNS == change.MtimeNS &&
+			existing.ExtractionVersion == change.ExtractionVersion {
 			if _, err := tx.Exec("UPDATE documents SET seen_generation = ? WHERE id = ?", generation, existing.ID); err != nil {
 				return BatchStats{}, err
 			}

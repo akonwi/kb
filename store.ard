@@ -115,6 +115,14 @@ fn migrations() [sqlite::Migration] {
         END;
         `,
     },
+    sqlite::Migration{
+      Version: 4,
+      Name: "version markdown extraction",
+      SQL: `
+        ALTER TABLE content
+          ADD COLUMN extraction_version INTEGER NOT NULL DEFAULT 0;
+        `,
+    },
   ]
 }
 
@@ -245,6 +253,7 @@ test fn generation_migration_upgrades_existing_index() Void!Str {
   )
   // Apply the generation migration after data already exists.
   let _ = try database.db.ApplyMigration(plan.at(2).expect("migration three")).map_err(error_message)
+  let _ = try database.db.ApplyMigration(plan.at(3).expect("migration four")).map_err(error_message)
   let generation = try database.db.BeginUpdate(collection.ID).map_err(error_message)
   let changes: mut [sqlite::IndexChange] = mut [
     sqlite::IndexChange{
@@ -256,6 +265,7 @@ test fn generation_migration_upgrades_existing_index() Void!Str {
       SizeBytes: 17,
       MtimeNS: 123,
       HasContent: false,
+      ExtractionVersion: 0,
     },
   ]
   let _ = try database.db.ApplyIndexBatch(collection.ID, generation, changes).map_err(error_message)
@@ -272,10 +282,10 @@ test fn migrations_apply_and_survive_reopen() Void!Str {
   defer os::RemoveAll(temp.dir)
   
   let first = try open_store(temp.path).map_err(error_message)
-  try testing::assert((try first.migrate().map_err(error_message)) == 3, "expected three migrations")
+  try testing::assert((try first.migrate().map_err(error_message)) == 4, "expected four migrations")
   try testing::assert(
-    (try first.current_version().map_err(error_message)) == 3,
-    "expected schema version 3",
+    (try first.current_version().map_err(error_message)) == 4,
+    "expected schema version 4",
   )
   try first.close().map_err(error_message)
   
@@ -286,7 +296,7 @@ test fn migrations_apply_and_survive_reopen() Void!Str {
     "expected no pending migrations",
   )
   try testing::assert(
-    (try reopened.current_version().map_err(error_message)) == 3,
+    (try reopened.current_version().map_err(error_message)) == 4,
     "expected version after reopen",
   )
   testing::pass()
@@ -301,7 +311,7 @@ test fn newer_database_version_is_rejected() Void!Str {
   let _ = try store.migrate().map_err(error_message)
   let _ = try store.db.ApplyMigration(
     sqlite::Migration{
-      Version: 4,
+      Version: 5,
       Name: "future schema",
       SQL: "CREATE TABLE future_table (id INTEGER)",
     },
@@ -320,7 +330,7 @@ test fn failed_migration_rolls_back() Void!Str {
   
   let failed = store.db.ApplyMigration(
     sqlite::Migration{
-      Version: 4,
+      Version: 5,
       Name: "fail after creating a table",
       SQL: `
         CREATE TABLE should_rollback (id INTEGER PRIMARY KEY);
@@ -330,7 +340,7 @@ test fn failed_migration_rolls_back() Void!Str {
   )
   try testing::assert(failed.is_err(), "expected migration failure")
   try testing::assert(
-    (try store.current_version().map_err(error_message)) == 3,
+    (try store.current_version().map_err(error_message)) == 4,
     "failed migration must not advance version",
   )
   let exists = try store.db.TableExists("should_rollback").map_err(error_message)

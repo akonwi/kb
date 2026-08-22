@@ -21,6 +21,7 @@ Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 ## Technical notes
 
 - [Benchmarks](benchmarks.md)
+- [Markdown indexing](markdown-indexing.md)
 
 ## ADR index
 

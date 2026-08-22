@@ -1,0 +1,4 @@
+{
+  "Title": "Searchable title",
+  "SearchableText": "Searchable title\nA paragraph with bold text, visible link, and inline_code.\nQuoted knowledge.\nfirst item\nsecond item\nfunc indexedCode() string { return \"code token\" }\nName\nPurpose\nFTS5\nlexical search"
+}

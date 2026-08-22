@@ -35,7 +35,7 @@ This confirms that `modernc.org/sqlite` includes FTS5 and its built-in BM25 func
 
 ## Incremental indexing baseline
 
-`benchmark_update.ard` creates 2,000 real Markdown files, runs the bounded indexing pipeline, performs a no-change update, and then forces verification. A concurrent filesystem metadata probe records the slowest observed response while initial indexing runs.
+`benchmark_update.ard` creates 2,000 real Markdown files, runs the bounded indexing and Goldmark extraction pipeline, performs a no-change update, and then forces verification. A concurrent filesystem metadata probe records the slowest observed response while initial indexing runs.
 
 Run it with:
 
@@ -47,8 +47,8 @@ Recorded on the same machine and toolchain as the FTS5 baseline:
 
 | Run | Initial update | Files/s | Max FS probe | No-change update | Bodies read | Verify update | Peak reserved source bytes | Ending Go heap |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 242 ms | 8,266 | 0.057 ms | 49 ms | 0 | 70 ms | 92,558 | 3,756,352 bytes |
-| 2 | 242 ms | 8,247 | 0.090 ms | 47 ms | 0 | 68 ms | 92,558 | 4,579,888 bytes |
-| 3 | 280 ms | 7,130 | 0.043 ms | 45 ms | 0 | 79 ms | 92,558 | 2,278,912 bytes |
+| 1 | 272 ms | 7,342 | 0.093 ms | 64 ms | 0 | 106 ms | 92,558 | 3,649,960 bytes |
+| 2 | 267 ms | 7,482 | 0.028 ms | 65 ms | 0 | 102 ms | 92,558 | 2,820,400 bytes |
+| 3 | 301 ms | 6,635 | 0.049 ms | 65 ms | 0 | 118 ms | 92,558 | 4,942,424 bytes |
 
 The no-change path opens no document bodies and the filesystem remained responsive during this small-corpus run. Reserved source bytes describe the pipeline's file-content budget, not total process memory; the ending heap measurement provides additional context but is not peak RSS.
