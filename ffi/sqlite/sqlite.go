@@ -80,10 +80,10 @@ func (db *DB) FTS5Enabled() (bool, error) {
 	return enabled == 1, err
 }
 
-// CreateIndex creates the representative FTS5 schema used by the spike.
+// CreateIndex creates the isolated representative FTS5 schema used by the spike.
 func (db *DB) CreateIndex() error {
 	_, err := db.conn.ExecContext(context.Background(), `
-		CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+		CREATE VIRTUAL TABLE IF NOT EXISTS spike_documents_fts USING fts5(
 			path,
 			title,
 			body,
@@ -93,7 +93,7 @@ func (db *DB) CreateIndex() error {
 	return err
 }
 
-// InsertDocuments inserts a batch with one prepared statement and transaction.
+// InsertDocuments inserts a batch into the isolated spike index.
 func (db *DB) InsertDocuments(documents []Document) error {
 	tx, err := db.conn.BeginTx(context.Background(), nil)
 	if err != nil {
@@ -101,7 +101,7 @@ func (db *DB) InsertDocuments(documents []Document) error {
 	}
 	defer tx.Rollback()
 
-	insert, err := tx.Prepare("INSERT INTO documents_fts(path, title, body) VALUES (?, ?, ?)")
+	insert, err := tx.Prepare("INSERT INTO spike_documents_fts(path, title, body) VALUES (?, ?, ?)")
 	if err != nil {
 		return err
 	}
@@ -116,20 +116,21 @@ func (db *DB) InsertDocuments(documents []Document) error {
 	return tx.Commit()
 }
 
-// Search returns the strongest matches first. FTS5 BM25 ranks lower values as
-// more relevant, so the SQL ordering is ascending.
-func (db *DB) Search(query string, limit int) ([]SearchResult, error) {
+func (db *DB) searchTable(table, query string, limit int) ([]SearchResult, error) {
 	if limit <= 0 {
 		return []SearchResult{}, nil
 	}
-
-	rows, err := db.conn.QueryContext(context.Background(), `
-		SELECT rowid, path, title, bm25(documents_fts, 1.0, 5.0, 1.0) AS rank
-		FROM documents_fts
-		WHERE documents_fts MATCH ?
+	if table != "documents_fts" && table != "spike_documents_fts" {
+		return nil, fmt.Errorf("unsupported FTS table %q", table)
+	}
+	statement := fmt.Sprintf(`
+		SELECT rowid, path, title, bm25(%[1]s, 1.0, 5.0, 1.0) AS rank
+		FROM %[1]s
+		WHERE %[1]s MATCH ?
 		ORDER BY rank ASC, rowid ASC
 		LIMIT ?
-	`, query, limit)
+	`, table)
+	rows, err := db.conn.QueryContext(context.Background(), statement, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -147,4 +148,14 @@ func (db *DB) Search(query string, limit int) ([]SearchResult, error) {
 		return nil, err
 	}
 	return results, nil
+}
+
+// Search returns ranked matches from the trigger-maintained production index.
+func (db *DB) Search(query string, limit int) ([]SearchResult, error) {
+	return db.searchTable("documents_fts", query, limit)
+}
+
+// SearchSpike returns ranked matches from the isolated storage spike index.
+func (db *DB) SearchSpike(query string, limit int) ([]SearchResult, error) {
+	return db.searchTable("spike_documents_fts", query, limit)
 }

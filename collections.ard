@@ -1,0 +1,66 @@
+use ard/testing
+
+use go:kb/ffi/fs
+use go:kb/ffi/sqlite
+use kb/store
+use go:os
+
+fn create(
+  database: store::Store,
+  name: Str,
+  root_path: Str,
+  glob_pattern: Str,
+  ignore_patterns: [Str],
+) sqlite::Collection!Error {
+  let root = try fs::CanonicalDirectory(root_path)
+  let ignores: mut [Str] = mut []
+  for pattern in ignore_patterns {
+    ignores.push(pattern)
+  }
+  try fs::ValidatePatterns(glob_pattern, ignores)
+  database.db.InsertCollection(name, root, glob_pattern, ignores)
+}
+
+fn list(database: store::Store) [sqlite::Collection]!Error {
+  database.db.ListCollections()
+}
+
+fn show(database: store::Store, name: Str) sqlite::CollectionLookup!Error {
+  database.db.LookupCollection(name)
+}
+
+fn remove(database: store::Store, name: Str) Bool!Error {
+  database.db.DeleteCollectionByName(name)
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn collection_operations_use_canonical_directories() Void!Str {
+  let root = try os::MkdirTemp("", "kb-collection-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-collection-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let created = try create(database, "notes", root, "**/*.md", ["archive/**"]).map_err(error_message)
+  let canonical = try fs::CanonicalDirectory(root).map_err(error_message)
+  try testing::assert(created.RootPath == canonical, "expected canonical root")
+  try testing::assert(created.IgnorePatterns.size() == 1, "expected typed ignore patterns")
+  
+  let found = try show(database, "NOTES").map_err(error_message)
+  try testing::assert(
+    found.Found and found.Collection.ID == created.ID,
+    "expected case-insensitive lookup",
+  )
+  try testing::assert((try list(database).map_err(error_message)).size() == 1, "expected collection list")
+  try testing::assert(try remove(database, "notes").map_err(error_message), "expected collection removal")
+  try testing::assert(
+    not (try show(database, "notes").map_err(error_message)).Found,
+    "expected removed collection",
+  )
+  testing::pass()
+}

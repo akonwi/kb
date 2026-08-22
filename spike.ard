@@ -41,7 +41,7 @@ fn run() Void!Error {
   try db.CreateIndex()
   let docs: mut [sqlite::Document] = mut documents()
   try db.InsertDocuments(docs)
-  let results = try db.Search("sqlite migrations", 10)
+  let results = try db.SearchSpike("sqlite migrations", 10)
   
   for result in results {
     fmt::Printf("%.6f  %s  %s\n", result.Rank, result.Path, result.Title)
@@ -79,7 +79,7 @@ test fn searches_an_fts5_index() Void!Str {
     err.error()
   })
   
-  let results = try db.Search(
+  let results = try db.SearchSpike(
     "sqlite migrations",
     10,
   ).map_err(fn(err: Error) Str {

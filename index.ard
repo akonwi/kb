@@ -1,0 +1,539 @@
+use ard/async
+use ard/testing
+
+use kb/collections
+use go:kb/ffi/fs
+use go:kb/ffi/sqlite
+use kb/store
+use go:os
+
+struct UpdateOptions {
+  verify: Bool,
+  readers: Int,
+  entry_buffer: Int,
+  job_buffer: Int,
+  change_buffer: Int,
+  batch_size: Int,
+  batch_bytes: Int,
+  in_flight_bytes: Int,
+  max_file_bytes: Int,
+}
+
+fn default_options(verify: Bool?) UpdateOptions {
+  UpdateOptions{
+    verify: verify.or(false),
+    readers: 4,
+    entry_buffer: 128,
+    job_buffer: 8,
+    change_buffer: 8,
+    batch_size: 64,
+    batch_bytes: 8 * 1024 * 1024,
+    in_flight_bytes: 64 * 1024 * 1024,
+    max_file_bytes: 32 * 1024 * 1024,
+  }
+}
+
+private fn constrained_options(max_file_bytes: Int) UpdateOptions {
+  UpdateOptions{
+    verify: false,
+    readers: 2,
+    entry_buffer: 4,
+    job_buffer: 2,
+    change_buffer: 2,
+    batch_size: 4,
+    batch_bytes: 4,
+    in_flight_bytes: max_file_bytes + 4,
+    max_file_bytes: max_file_bytes,
+  }
+}
+
+struct ReadJob {
+  entry: fs::Entry,
+  reserved_bytes: Int,
+}
+
+struct WriteItem {
+  change: sqlite::IndexChange,
+  reserved_bytes: Int,
+}
+
+struct StageDone {
+  message: Str,
+  files: Int,
+  bytes: Int,
+}
+
+struct WriterDone {
+  message: Str,
+  inserted: Int,
+  updated: Int,
+  seen: Int,
+  batches: Int,
+}
+
+struct FlushResult {
+  message: Str,
+  inserted: Int,
+  updated: Int,
+  seen: Int,
+}
+
+struct UpdateStats {
+  walked: Int,
+  unchanged: Int,
+  read: Int,
+  bytes_read: Int,
+  inserted: Int,
+  updated: Int,
+  removed: Int,
+  batches: Int,
+  peak_in_flight_bytes: Int,
+}
+
+fn validate_options(options: UpdateOptions) Void!Error {
+  let valid = options.readers > 0 and options.entry_buffer > 0 and options.job_buffer > 0 and options.change_buffer > 0 and options.batch_size > 0 and options.batch_bytes > 0 and options.in_flight_bytes > 0 and options.max_file_bytes > 0 and options.max_file_bytes + options.batch_bytes <= options.in_flight_bytes
+  match valid {
+    true => Result::ok(()),
+    false => Result::err(Error::new("invalid indexing limits")),
+  }
+}
+
+fn start_walk(
+  scanner: mut fs::Scanner,
+  collection: sqlite::Collection,
+  entries: Sender<fs::Entry>,
+  done: Sender<StageDone>,
+) {
+  async::start(fn() {
+    let ignores: mut [Str] = mut []
+    for pattern in collection.IgnorePatterns {
+      ignores.push(pattern)
+    }
+    let message = match scanner.Walk(collection.GlobPattern, ignores, entries) {
+      ok => "",
+      err(error) => "walk {collection.RootPath}: {error.error()}",
+    }
+    entries.close()
+    done.send(
+      StageDone{
+        message: message,
+        files: 0,
+        bytes: 0,
+      },
+    )
+  })
+}
+
+fn start_reader(
+  jobs: Receiver<ReadJob>,
+  changes: Sender<WriteItem>,
+  done: Sender<StageDone>,
+  budget: mut fs::ByteBudget,
+  scanner: mut fs::Scanner,
+) {
+  async::start(fn() {
+    mut message = ""
+    mut files = 0
+    mut bytes = 0
+    mut running = true
+    while running {
+      match jobs.recv() {
+        job => {
+          match scanner.ReadAndHash(job.entry) {
+            ok(read) => {
+              files =+ 1
+              bytes =+ read.SizeBytes
+              changes.send(
+                WriteItem{
+                  change: sqlite::IndexChange{
+                    RelativePath: read.RelativePath,
+                    Title: read.Title,
+                    ContentHash: read.Hash,
+                    Markdown: read.Markdown,
+                    SearchableText: read.SearchableText,
+                    SizeBytes: read.SizeBytes,
+                    MtimeNS: read.MtimeNS,
+                    HasContent: true,
+                  },
+                  reserved_bytes: job.reserved_bytes,
+                },
+              )
+            },
+            err(error) => {
+              budget.Release(job.reserved_bytes)
+              if message.is_empty() {
+                message = "read {job.entry.RelativePath}: {error.error()}"
+              }
+            },
+          }
+        },
+        _ => { running = false },
+      }
+    }
+    done.send(
+      StageDone{
+        message: message,
+        files: files,
+        bytes: bytes,
+      },
+    )
+  })
+}
+
+fn flush_batch(
+  db: mut sqlite::DB,
+  collection_id: Int,
+  generation: Int,
+  items: [WriteItem],
+  budget: mut fs::ByteBudget,
+) FlushResult {
+  let changes: mut [sqlite::IndexChange] = mut []
+  for item in items {
+    changes.push(item.change)
+  }
+  let applied = db.ApplyIndexBatch(collection_id, generation, changes)
+  for item in items {
+    budget.Release(item.reserved_bytes)
+  }
+  match applied {
+    ok(stats) => {
+      FlushResult{
+        message: "",
+        inserted: stats.Inserted,
+        updated: stats.Updated,
+        seen: stats.Seen,
+      }
+    },
+    err(error) => {
+      FlushResult{
+        message: "write index batch: {error.error()}",
+        inserted: 0,
+        updated: 0,
+        seen: 0,
+      }
+    },
+  }
+}
+
+fn start_writer(
+  db: mut sqlite::DB,
+  collection_id: Int,
+  generation: Int,
+  changes: Receiver<WriteItem>,
+  done: Sender<WriterDone>,
+  budget: mut fs::ByteBudget,
+  options: UpdateOptions,
+) {
+  async::start(fn() {
+    mut message = ""
+    mut inserted = 0
+    mut updated = 0
+    mut seen = 0
+    mut batches = 0
+    mut batch_bytes = 0
+    mut batch: [WriteItem] = []
+    let batch_ref = mut batch
+    mut running = true
+    
+    while running {
+      match changes.recv() {
+        item => {
+          if message.is_empty() {
+            batch_ref.push(item)
+            batch_bytes =+ item.reserved_bytes
+            if batch_ref.size() >= options.batch_size or batch_bytes >= options.batch_bytes {
+              let flushed = flush_batch(db, collection_id, generation, batch_ref.@, budget)
+              message = flushed.message
+              inserted =+ flushed.inserted
+              updated =+ flushed.updated
+              seen =+ flushed.seen
+              batches =+ 1
+              batch = []
+              batch_bytes = 0
+            }
+          } else {
+            budget.Release(item.reserved_bytes)
+          }
+        },
+        _ => { running = false },
+      }
+    }
+    
+    if message.is_empty() and batch_ref.size() > 0 {
+      let flushed = flush_batch(db, collection_id, generation, batch_ref.@, budget)
+      message = flushed.message
+      inserted =+ flushed.inserted
+      updated =+ flushed.updated
+      seen =+ flushed.seen
+      batches =+ 1
+    }
+    done.send(
+      WriterDone{
+        message: message,
+        inserted: inserted,
+        updated: updated,
+        seen: seen,
+        batches: batches,
+      },
+    )
+  })
+}
+
+fn first_message(current: Str, candidate: Str) Str {
+  match current.is_empty() and not candidate.is_empty() {
+    true => candidate,
+    false => current,
+  }
+}
+
+fn update(database: store::Store, collection: sqlite::Collection, options: UpdateOptions) UpdateStats!Error {
+  try validate_options(options)
+  let metadata_rows = try database.db.ListDocumentMetadata(collection.ID)
+  let metadata: mut [Str: sqlite::DocumentMetadata] = mut [:]
+  for document in metadata_rows {
+    metadata.set(document.RelativePath, document)
+  }
+  let generation = try database.db.BeginUpdate(collection.ID)
+  let budget = try fs::NewByteBudget(options.in_flight_bytes)
+  let scanner = try fs::OpenScanner(collection.RootPath)
+  defer scanner.Close()
+  
+  let entries = Chan::new<fs::Entry>(options.entry_buffer)
+  let jobs = Chan::new<ReadJob>(options.job_buffer)
+  let changes = Chan::new<WriteItem>(options.change_buffer)
+  let walk_done = Chan::new<StageDone>(1)
+  let reader_done = Chan::new<StageDone>(options.readers)
+  let writer_done = Chan::new<WriterDone>(1)
+  
+  start_writer(
+    database.db,
+    collection.ID,
+    generation,
+    changes.receiver(),
+    writer_done.sender(),
+    budget,
+    options,
+  )
+  for _ in 1..options.readers {
+    start_reader(jobs.receiver(), changes.sender(), reader_done.sender(), budget, scanner)
+  }
+  start_walk(scanner, collection, entries.sender(), walk_done.sender())
+  
+  mut walked = 0
+  mut unchanged = 0
+  mut coordinator_error = ""
+  mut reading_entries = true
+  while reading_entries {
+    match entries.receiver().recv() {
+      entry => {
+        walked =+ 1
+        let should_read = match metadata.get(entry.RelativePath) {
+          existing => {
+            options.verify or existing.SizeBytes != entry.SizeBytes or existing.MtimeNS != entry.MtimeNS
+          },
+          _ => true,
+        }
+        if should_read {
+          if entry.SizeBytes > options.max_file_bytes {
+            coordinator_error = first_message(
+              coordinator_error,
+              "file {entry.RelativePath} exceeds maximum size {options.max_file_bytes}",
+            )
+          } else {
+            match budget.Reserve(entry.SizeBytes) {
+              ok(reserved) => jobs.sender().send(ReadJob{entry: entry, reserved_bytes: reserved}),
+              err(error) => {
+                coordinator_error = first_message(
+                  coordinator_error,
+                  "reserve {entry.RelativePath}: {error.error()}",
+                )
+              },
+            }
+          }
+        } else {
+          unchanged =+ 1
+          changes.sender().send(
+            WriteItem{
+              change: sqlite::IndexChange{
+                RelativePath: entry.RelativePath,
+                Title: "",
+                ContentHash: "",
+                Markdown: "",
+                SearchableText: "",
+                SizeBytes: entry.SizeBytes,
+                MtimeNS: entry.MtimeNS,
+                HasContent: false,
+              },
+              reserved_bytes: 0,
+            },
+          )
+        }
+      },
+      _ => { reading_entries = false },
+    }
+  }
+  
+  let walked_done = walk_done.receiver().recv().expect("walker reports completion")
+  coordinator_error = first_message(coordinator_error, walked_done.message)
+  jobs.sender().close()
+  
+  mut readers_finished = 0
+  mut read_files = 0
+  mut bytes_read = 0
+  while readers_finished < options.readers {
+    let completed = reader_done.receiver().recv().expect("reader reports completion")
+    readers_finished =+ 1
+    read_files =+ completed.files
+    bytes_read =+ completed.bytes
+    coordinator_error = first_message(coordinator_error, completed.message)
+  }
+  changes.sender().close()
+  let written = writer_done.receiver().recv().expect("writer reports completion")
+  coordinator_error = first_message(coordinator_error, written.message)
+  if budget.Used() != 0 or not budget.Healthy() {
+    coordinator_error = first_message(coordinator_error, "indexing byte-budget accounting failed")
+  }
+  
+  match coordinator_error.is_empty() {
+    false => Result::err(Error::new(coordinator_error)),
+    true => {
+      let removed = try database.db.FinalizeUpdate(collection.ID, generation)
+      Result::ok(
+        UpdateStats{
+          walked: walked,
+          unchanged: unchanged,
+          read: read_files,
+          bytes_read: bytes_read,
+          inserted: written.inserted,
+          updated: written.updated,
+          removed: removed,
+          batches: written.batches,
+          peak_in_flight_bytes: budget.Peak(),
+        },
+      )
+    },
+  }
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn incremental_update_skips_unchanged_and_removes_stale_documents() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  try os::WriteFile("{root}/one.md", mut "# One\n\nSQLite migrations".bytes(), 420).map_err(error_message)
+  try os::MkdirAll("{root}/nested", 493).map_err(error_message)
+  try os::WriteFile(
+    "{root}/nested/two.md",
+    mut "# Two\n\nArd channels".bytes(),
+    420,
+  ).map_err(error_message)
+  try os::WriteFile("{root}/ignored.txt", mut "ignored".bytes(), 420).map_err(error_message)
+  
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let options = default_options()
+  
+  let initial = try update(database, collection, options).map_err(error_message)
+  try testing::assert(
+    initial.walked == 2 and initial.read == 2 and initial.inserted == 2,
+    "expected initial indexing",
+  )
+  let unchanged = try update(database, collection, options).map_err(error_message)
+  try testing::assert(unchanged.read == 0 and unchanged.unchanged == 2, "expected no-read update")
+  
+  try os::Remove("{root}/nested/two.md").map_err(error_message)
+  let removed = try update(database, collection, options).map_err(error_message)
+  try testing::assert(removed.removed == 1, "expected stale document removal")
+  let matches = try database.db.Search("channels", 10).map_err(error_message)
+  try testing::assert(matches.size() == 0, "removed document must leave FTS")
+  testing::pass()
+}
+
+test fn failed_scan_does_not_deactivate_unseen_documents() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-failure-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-failure-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  try os::WriteFile("{root}/keep.md", mut "keep".bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/stale.md", mut "stale".bytes(), 420).map_err(error_message)
+  
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let _ = try update(database, collection, constrained_options(10)).map_err(error_message)
+  
+  try os::Remove("{root}/stale.md").map_err(error_message)
+  try os::WriteFile(
+    "{root}/oversized.md",
+    mut "this file is too large".bytes(),
+    420,
+  ).map_err(error_message)
+  try testing::assert(
+    update(database, collection, constrained_options(10)).is_err(),
+    "expected oversized file failure",
+  )
+  let stale = try database.db.Search("stale", 10).map_err(error_message)
+  try testing::assert(stale.size() == 1, "failed update must not finalize stale paths")
+  testing::pass()
+}
+
+test fn bounded_pipeline_handles_more_files_than_channel_capacity() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-bounded-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-bounded-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  for mut i = 0; i < 40; i =+ 1 {
+    try os::WriteFile("{root}/doc-{i}.md", mut "document {i}".bytes(), 420).map_err(error_message)
+  }
+  
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let limits = constrained_options(20)
+  let indexed = try update(database, collection, limits).map_err(error_message)
+  try testing::assert(
+    indexed.inserted == 40 and indexed.read == 40,
+    "expected every file to pass through bounded channels",
+  )
+  try testing::assert(indexed.batches > 1, "expected multiple bounded writer batches")
+  try testing::assert(
+    indexed.peak_in_flight_bytes <= limits.in_flight_bytes,
+    "in-flight bytes must remain bounded",
+  )
+  testing::pass()
+}
+
+test fn verify_rehashes_files_with_unchanged_metadata() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-verify-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-verify-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  let path = "{root}/doc.md"
+  try os::WriteFile(path, mut "first body".bytes(), 420).map_err(error_message)
+  let original = try os::Stat(path).map_err(error_message)
+  
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let _ = try update(database, collection, default_options()).map_err(error_message)
+  
+  try os::WriteFile(path, mut "other body".bytes(), 420).map_err(error_message)
+  try os::Chtimes(path, original.ModTime(), original.ModTime()).map_err(error_message)
+  let skipped = try update(database, collection, default_options()).map_err(error_message)
+  try testing::assert(skipped.read == 0, "normal update should trust unchanged metadata")
+  
+  let verified = try update(database, collection, default_options(true)).map_err(error_message)
+  try testing::assert(verified.read == 1 and verified.updated == 1, "verify must rehash the file")
+  let matches = try database.db.Search("other", 10).map_err(error_message)
+  try testing::assert(matches.size() == 1, "verify must update searchable content")
+  testing::pass()
+}

@@ -1,0 +1,138 @@
+use ard/async
+
+use go:fmt
+use kb/collections
+use go:kb/ffi/metrics
+use go:kb/ffi/sqlite
+use kb/index
+use kb/store
+use go:os
+use go:strings
+use go:time
+
+let document_count = 2_000
+
+struct UpdateDone {
+  stats: index::UpdateStats,
+  message: Str,
+}
+
+struct Measurement {
+  stats: index::UpdateStats,
+  duration_ns: Int,
+  max_probe_ns: Int,
+}
+
+fn empty_stats() index::UpdateStats {
+  index::UpdateStats{
+    walked: 0,
+    unchanged: 0,
+    read: 0,
+    bytes_read: 0,
+    inserted: 0,
+    updated: 0,
+    removed: 0,
+    batches: 0,
+    peak_in_flight_bytes: 0,
+  }
+}
+
+fn measure_update(
+  database: store::Store,
+  collection: sqlite::Collection,
+  options: index::UpdateOptions,
+) Measurement!Error {
+  let done = Chan::new<UpdateDone>(1)
+  let started = time::Now()
+  async::start(fn() {
+    let completed = match index::update(database, collection, options) {
+      ok(stats) => UpdateDone{stats: stats, message: ""},
+      err(error) => UpdateDone{stats: empty_stats(), message: error.error()},
+    }
+    done.sender().send(completed)
+  })
+  
+  mut result: UpdateDone? = Maybe::new()
+  mut max_probe_ns = 0
+  while result.is_none() {
+    select {
+      let completed = done.receiver().recv() => { result = completed },
+      time::After(time::Millisecond).recv() => {
+        let probe_started = time::Now()
+        let _ = os::Stat(collection.RootPath)
+        let probe_ns = metrics::Nanoseconds(time::Since(probe_started))
+        if probe_ns > max_probe_ns {
+          max_probe_ns = probe_ns
+        }
+      },
+    }
+  }
+  let completed = result.expect("update completion")
+  match completed.message.is_empty() {
+    true => {
+      Result::ok(
+        Measurement{
+          stats: completed.stats,
+          duration_ns: metrics::Nanoseconds(time::Since(started)),
+          max_probe_ns: max_probe_ns,
+        },
+      )
+    },
+    false => Result::err(Error::new(completed.message)),
+  }
+}
+
+fn ensure_benchmark_correct(unchanged: index::UpdateStats, verified: index::UpdateStats) Void!Error {
+  match unchanged.read == 0 and verified.read == document_count {
+    true => Result::ok(()),
+    false => Result::err(Error::new("benchmark correctness assertion failed")),
+  }
+}
+
+fn run_benchmark() Void!Error {
+  let root = try os::MkdirTemp("", "kb-update-benchmark-root-")
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-update-benchmark-db-")
+  defer os::RemoveAll(database_dir)
+  let body = strings::Repeat(
+    "Representative Markdown content for local knowledge-base indexing. ",
+    16,
+  )
+  for mut i = 0; i < document_count; i =+ 1 {
+    try os::WriteFile("{root}/document-{i}.md", mut "# Document {i}\n\n{body}".bytes(), 420)
+  }
+  
+  let database_path = "{database_dir}/index.sqlite"
+  let database = try store::open_store(database_path)
+  defer database.close()
+  let _ = try database.migrate()
+  let collection = try collections::create(database, "benchmark", root, "**/*.md", [])
+  
+  let initial = try measure_update(database, collection, index::default_options())
+  let unchanged = try measure_update(database, collection, index::default_options())
+  let verified = try measure_update(database, collection, index::default_options(true))
+  let heap_bytes = metrics::HeapAllocBytes()
+  try database.close()
+  let info = try os::Stat(database_path)
+  
+  try ensure_benchmark_correct(unchanged.stats, verified.stats)
+  fmt::Println("documents={document_count}")
+  fmt::Println("initial_update_ns={initial.duration_ns}")
+  fmt::Println("initial_files_per_second={document_count * 1_000_000_000 / initial.duration_ns}")
+  fmt::Println("initial_max_fs_probe_ns={initial.max_probe_ns}")
+  fmt::Println("initial_peak_reserved_source_bytes={initial.stats.peak_in_flight_bytes}")
+  fmt::Println("ending_heap_alloc_bytes={heap_bytes}")
+  fmt::Println("no_change_update_ns={unchanged.duration_ns}")
+  fmt::Println("no_change_files_read={unchanged.stats.read}")
+  fmt::Println("verify_update_ns={verified.duration_ns}")
+  fmt::Println("verify_files_read={verified.stats.read}")
+  fmt::Printf("database_bytes=%d\n", info.Size())
+  Result::ok(())
+}
+
+fn main() {
+  try run_benchmark() -> err {
+    fmt::Println("Error: {err.error()}")
+    os::Exit(1)
+  }
+}

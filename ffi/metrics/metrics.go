@@ -13,6 +13,11 @@ func HeapAllocBytes() int {
 	return int(stats.HeapAlloc)
 }
 
+// Nanoseconds returns a duration as the platform-sized integer Ard uses.
+func Nanoseconds(elapsed time.Duration) int {
+	return int(elapsed.Nanoseconds())
+}
+
 // AverageNanoseconds returns an integer average for a measured duration.
 func AverageNanoseconds(elapsed time.Duration, iterations int) int {
 	if iterations <= 0 {

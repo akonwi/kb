@@ -44,7 +44,7 @@ fn run_benchmark() Void!Error {
   
   let search_started = time::Now()
   for mut i = 0; i < search_iterations; i =+ 1 {
-    let _ = try db.Search("sqlite migrations", 10)
+    let _ = try db.SearchSpike("sqlite migrations", 10)
   }
   let search_ns = metrics::AverageNanoseconds(time::Since(search_started), search_iterations)
   let heap_bytes = metrics::HeapAllocBytes()

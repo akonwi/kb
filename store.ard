@@ -95,6 +95,26 @@ fn migrations() [sqlite::Migration] {
         END;
         `,
     },
+    sqlite::Migration{
+      Version: 3,
+      Name: "track index generations",
+      SQL: `
+        ALTER TABLE collections
+          ADD COLUMN current_generation INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE documents
+          ADD COLUMN seen_generation INTEGER NOT NULL DEFAULT 0;
+        DROP TRIGGER documents_fts_update;
+        CREATE TRIGGER documents_fts_update
+        AFTER UPDATE OF title, content_hash, active ON documents
+        BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+          INSERT INTO documents_fts(rowid, path, title, body)
+          SELECT new.id, new.relative_path, new.title, searchable_text
+          FROM content
+          WHERE hash = new.content_hash AND new.active = 1;
+        END;
+        `,
+    },
   ]
 }
 
@@ -155,7 +175,8 @@ impl Store {
   }
   
   fn add_collection(name: Str, root_path: Str, glob_pattern: Str) sqlite::Collection!Error {
-    self.db.InsertCollection(name, root_path, glob_pattern, "[]")
+    let ignores: mut [Str] = mut []
+    self.db.InsertCollection(name, root_path, glob_pattern, ignores)
   }
   
   fn collections() [sqlite::Collection]!Error {
@@ -199,15 +220,62 @@ private fn temp_database(prefix: Str) TempDatabase!Str {
   Result::ok(TempDatabase{dir: dir, path: filepath::Join(dir, "index.sqlite")})
 }
 
+test fn generation_migration_upgrades_existing_index() Void!Str {
+  let temp = try temp_database("kb-store-upgrade-")
+  defer os::RemoveAll(temp.dir)
+  let database = try open_store(temp.path).map_err(error_message)
+  defer database.close()
+  let plan = migrations()
+  let _ = try database.db.ApplyMigration(plan.at(0).expect("migration one")).map_err(error_message)
+  let _ = try database.db.ApplyMigration(plan.at(1).expect("migration two")).map_err(error_message)
+  let collection = try database.add_collection("notes", "/tmp/notes", "**/*.md").map_err(error_message)
+  let _ = try database.add_document(
+    collection.ID,
+    "existing.md",
+    "Existing",
+    "upgrade-hash",
+    "existing markdown",
+    "existing searchable body",
+    17,
+    123,
+  ).map_err(error_message)
+  try testing::assert(
+    (try database.db.Search("searchable", 10).map_err(error_message)).size() == 1,
+    "expected pre-upgrade FTS row",
+  )
+  // Apply the generation migration after data already exists.
+  let _ = try database.db.ApplyMigration(plan.at(2).expect("migration three")).map_err(error_message)
+  let generation = try database.db.BeginUpdate(collection.ID).map_err(error_message)
+  let changes: mut [sqlite::IndexChange] = mut [
+    sqlite::IndexChange{
+      RelativePath: "existing.md",
+      Title: "",
+      ContentHash: "",
+      Markdown: "",
+      SearchableText: "",
+      SizeBytes: 17,
+      MtimeNS: 123,
+      HasContent: false,
+    },
+  ]
+  let _ = try database.db.ApplyIndexBatch(collection.ID, generation, changes).map_err(error_message)
+  let _ = try database.db.FinalizeUpdate(collection.ID, generation).map_err(error_message)
+  try testing::assert(
+    (try database.db.Search("searchable", 10).map_err(error_message)).size() == 1,
+    "metadata update must preserve upgraded FTS row",
+  )
+  testing::pass()
+}
+
 test fn migrations_apply_and_survive_reopen() Void!Str {
   let temp = try temp_database("kb-store-reopen-")
   defer os::RemoveAll(temp.dir)
   
   let first = try open_store(temp.path).map_err(error_message)
-  try testing::assert((try first.migrate().map_err(error_message)) == 2, "expected two migrations")
+  try testing::assert((try first.migrate().map_err(error_message)) == 3, "expected three migrations")
   try testing::assert(
-    (try first.current_version().map_err(error_message)) == 2,
-    "expected schema version 2",
+    (try first.current_version().map_err(error_message)) == 3,
+    "expected schema version 3",
   )
   try first.close().map_err(error_message)
   
@@ -218,7 +286,7 @@ test fn migrations_apply_and_survive_reopen() Void!Str {
     "expected no pending migrations",
   )
   try testing::assert(
-    (try reopened.current_version().map_err(error_message)) == 2,
+    (try reopened.current_version().map_err(error_message)) == 3,
     "expected version after reopen",
   )
   testing::pass()
@@ -233,7 +301,7 @@ test fn newer_database_version_is_rejected() Void!Str {
   let _ = try store.migrate().map_err(error_message)
   let _ = try store.db.ApplyMigration(
     sqlite::Migration{
-      Version: 3,
+      Version: 4,
       Name: "future schema",
       SQL: "CREATE TABLE future_table (id INTEGER)",
     },
@@ -252,7 +320,7 @@ test fn failed_migration_rolls_back() Void!Str {
   
   let failed = store.db.ApplyMigration(
     sqlite::Migration{
-      Version: 3,
+      Version: 4,
       Name: "fail after creating a table",
       SQL: `
         CREATE TABLE should_rollback (id INTEGER PRIMARY KEY);
@@ -262,7 +330,7 @@ test fn failed_migration_rolls_back() Void!Str {
   )
   try testing::assert(failed.is_err(), "expected migration failure")
   try testing::assert(
-    (try store.current_version().map_err(error_message)) == 2,
+    (try store.current_version().map_err(error_message)) == 3,
     "failed migration must not advance version",
   )
   let exists = try store.db.TableExists("should_rollback").map_err(error_message)

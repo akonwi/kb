@@ -1,6 +1,11 @@
 package sqlite
 
-import "context"
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+)
 
 // Collection is a directory registered in the knowledge base.
 type Collection struct {
@@ -8,9 +13,15 @@ type Collection struct {
 	Name           string
 	RootPath       string
 	GlobPattern    string
-	IgnorePatterns string
+	IgnorePatterns []string
 	CreatedAt      string
 	UpdatedAt      string
+}
+
+// CollectionLookup avoids a nullable foreign pointer at the Ard boundary.
+type CollectionLookup struct {
+	Found      bool
+	Collection Collection
 }
 
 // DocumentRecord is a document persisted in the core schema.
@@ -24,25 +35,39 @@ type DocumentRecord struct {
 	MtimeNS      int
 }
 
-// InsertCollection creates and returns a collection.
-func (db *DB) InsertCollection(name, rootPath, globPattern, ignorePatterns string) (Collection, error) {
-	row := db.conn.QueryRowContext(context.Background(), `
-		INSERT INTO collections(name, root_path, glob_pattern, ignore_patterns)
-		VALUES (?, ?, ?, ?)
-		RETURNING id, name, root_path, glob_pattern, ignore_patterns, created_at, updated_at
-	`, name, rootPath, globPattern, ignorePatterns)
-
+func scanCollection(scanner interface{ Scan(...any) error }) (Collection, error) {
 	var collection Collection
-	err := row.Scan(
+	var ignoreJSON string
+	err := scanner.Scan(
 		&collection.ID,
 		&collection.Name,
 		&collection.RootPath,
 		&collection.GlobPattern,
-		&collection.IgnorePatterns,
+		&ignoreJSON,
 		&collection.CreatedAt,
 		&collection.UpdatedAt,
 	)
-	return collection, err
+	if err != nil {
+		return Collection{}, err
+	}
+	if err := json.Unmarshal([]byte(ignoreJSON), &collection.IgnorePatterns); err != nil {
+		return Collection{}, fmt.Errorf("decode ignore patterns for %q: %w", collection.Name, err)
+	}
+	return collection, nil
+}
+
+// InsertCollection creates and returns a collection.
+func (db *DB) InsertCollection(name, rootPath, globPattern string, ignorePatterns []string) (Collection, error) {
+	ignoreJSON, err := json.Marshal(ignorePatterns)
+	if err != nil {
+		return Collection{}, err
+	}
+	row := db.conn.QueryRowContext(context.Background(), `
+		INSERT INTO collections(name, root_path, glob_pattern, ignore_patterns)
+		VALUES (?, ?, ?, ?)
+		RETURNING id, name, root_path, glob_pattern, ignore_patterns, created_at, updated_at
+	`, name, rootPath, globPattern, string(ignoreJSON))
+	return scanCollection(row)
 }
 
 // ListCollections returns collections in stable name order.
@@ -59,16 +84,8 @@ func (db *DB) ListCollections() ([]Collection, error) {
 
 	collections := make([]Collection, 0)
 	for rows.Next() {
-		var collection Collection
-		if err := rows.Scan(
-			&collection.ID,
-			&collection.Name,
-			&collection.RootPath,
-			&collection.GlobPattern,
-			&collection.IgnorePatterns,
-			&collection.CreatedAt,
-			&collection.UpdatedAt,
-		); err != nil {
+		collection, err := scanCollection(rows)
+		if err != nil {
 			return nil, err
 		}
 		collections = append(collections, collection)
@@ -77,6 +94,33 @@ func (db *DB) ListCollections() ([]Collection, error) {
 		return nil, err
 	}
 	return collections, nil
+}
+
+// LookupCollection finds a collection by its case-insensitive name.
+func (db *DB) LookupCollection(name string) (CollectionLookup, error) {
+	row := db.conn.QueryRowContext(context.Background(), `
+		SELECT id, name, root_path, glob_pattern, ignore_patterns, created_at, updated_at
+		FROM collections
+		WHERE name = ? COLLATE NOCASE
+	`, name)
+	collection, err := scanCollection(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return CollectionLookup{}, nil
+		}
+		return CollectionLookup{}, err
+	}
+	return CollectionLookup{Found: true, Collection: collection}, nil
+}
+
+// DeleteCollectionByName removes a collection and its cascaded documents.
+func (db *DB) DeleteCollectionByName(name string) (bool, error) {
+	result, err := db.conn.ExecContext(context.Background(), "DELETE FROM collections WHERE name = ? COLLATE NOCASE", name)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed > 0, err
 }
 
 // InsertDocument atomically stores content and its document metadata. FTS5 is
@@ -119,8 +163,7 @@ func (db *DB) InsertDocument(collectionID int, relativePath, title, hash, markdo
 	return document, nil
 }
 
-// DeleteCollection removes a collection. Foreign keys cascade through its
-// documents, whose delete trigger removes corresponding FTS5 rows.
+// DeleteCollection removes a collection by ID.
 func (db *DB) DeleteCollection(id int) error {
 	_, err := db.conn.ExecContext(context.Background(), "DELETE FROM collections WHERE id = ?", id)
 	return err

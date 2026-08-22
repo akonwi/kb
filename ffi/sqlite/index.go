@@ -1,0 +1,234 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// DocumentMetadata supports no-read change detection during a filesystem scan.
+type DocumentMetadata struct {
+	ID           int
+	RelativePath string
+	ContentHash  string
+	Title        string
+	SizeBytes    int
+	MtimeNS      int
+	Active       bool
+}
+
+// IndexChange is one filesystem observation sent to the SQLite writer.
+type IndexChange struct {
+	RelativePath   string
+	Title          string
+	ContentHash    string
+	Markdown       string
+	SearchableText string
+	SizeBytes      int
+	MtimeNS        int
+	HasContent     bool
+}
+
+// BatchStats describes one committed indexing batch.
+type BatchStats struct {
+	Inserted int
+	Updated  int
+	Seen     int
+}
+
+// ListDocumentMetadata returns all known paths, including inactive documents
+// that may reappear.
+func (db *DB) ListDocumentMetadata(collectionID int) ([]DocumentMetadata, error) {
+	rows, err := db.conn.QueryContext(context.Background(), `
+		SELECT id, relative_path, content_hash, title, size_bytes, mtime_ns, active
+		FROM documents
+		WHERE collection_id = ?
+		ORDER BY relative_path
+	`, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	metadata := make([]DocumentMetadata, 0)
+	for rows.Next() {
+		var item DocumentMetadata
+		if err := rows.Scan(
+			&item.ID,
+			&item.RelativePath,
+			&item.ContentHash,
+			&item.Title,
+			&item.SizeBytes,
+			&item.MtimeNS,
+			&item.Active,
+		); err != nil {
+			return nil, err
+		}
+		metadata = append(metadata, item)
+	}
+	return metadata, rows.Err()
+}
+
+// BeginUpdate advances and returns the generation owned by a new scan.
+func (db *DB) BeginUpdate(collectionID int) (int, error) {
+	var generation int
+	err := db.conn.QueryRowContext(context.Background(), `
+		UPDATE collections
+		SET current_generation = current_generation + 1,
+		    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE id = ?
+		RETURNING current_generation
+	`, collectionID).Scan(&generation)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("collection %d does not exist", collectionID)
+	}
+	return generation, err
+}
+
+func verifyGeneration(tx *sql.Tx, collectionID, generation int) error {
+	var current int
+	if err := tx.QueryRow("SELECT current_generation FROM collections WHERE id = ?", collectionID).Scan(&current); err != nil {
+		return err
+	}
+	if current != generation {
+		return fmt.Errorf("update generation %d was superseded by generation %d", generation, current)
+	}
+	return nil
+}
+
+// ApplyIndexBatch applies observations in one transaction. Metadata-only
+// observations never touch indexed fields unless an inactive document reappears.
+func (db *DB) ApplyIndexBatch(collectionID, generation int, changes []IndexChange) (BatchStats, error) {
+	tx, err := db.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return BatchStats{}, err
+	}
+	defer tx.Rollback()
+	if err := verifyGeneration(tx, collectionID, generation); err != nil {
+		return BatchStats{}, err
+	}
+
+	stats := BatchStats{}
+	for _, change := range changes {
+		var existing DocumentMetadata
+		err := tx.QueryRow(`
+			SELECT id, relative_path, content_hash, title, size_bytes, mtime_ns, active
+			FROM documents
+			WHERE collection_id = ? AND relative_path = ?
+		`, collectionID, change.RelativePath).Scan(
+			&existing.ID,
+			&existing.RelativePath,
+			&existing.ContentHash,
+			&existing.Title,
+			&existing.SizeBytes,
+			&existing.MtimeNS,
+			&existing.Active,
+		)
+		exists := err == nil
+		if err != nil && err != sql.ErrNoRows {
+			return BatchStats{}, err
+		}
+
+		if !change.HasContent {
+			if !exists {
+				return BatchStats{}, fmt.Errorf("metadata-only observation for unknown path %q", change.RelativePath)
+			}
+			statement := "UPDATE documents SET seen_generation = ? WHERE id = ?"
+			if !existing.Active {
+				statement = `
+					UPDATE documents
+					SET seen_generation = ?, active = 1,
+					    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+					WHERE id = ?
+				`
+			}
+			result, err := tx.Exec(statement, generation, existing.ID)
+			if err != nil {
+				return BatchStats{}, err
+			}
+			if changed, _ := result.RowsAffected(); changed != 1 {
+				return BatchStats{}, fmt.Errorf("metadata observation did not update %q", change.RelativePath)
+			}
+			if existing.Active {
+				stats.Seen++
+			} else {
+				stats.Updated++
+			}
+			continue
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO content(hash, markdown, searchable_text)
+			VALUES (?, ?, ?)
+			ON CONFLICT(hash) DO NOTHING
+		`, change.ContentHash, change.Markdown, change.SearchableText); err != nil {
+			return BatchStats{}, err
+		}
+
+		if exists && existing.Active &&
+			existing.ContentHash == change.ContentHash && existing.Title == change.Title &&
+			existing.SizeBytes == change.SizeBytes && existing.MtimeNS == change.MtimeNS {
+			if _, err := tx.Exec("UPDATE documents SET seen_generation = ? WHERE id = ?", generation, existing.ID); err != nil {
+				return BatchStats{}, err
+			}
+			stats.Seen++
+			continue
+		}
+
+		if exists {
+			if _, err := tx.Exec(`
+				UPDATE documents
+				SET title = ?, content_hash = ?, size_bytes = ?, mtime_ns = ?,
+				    active = 1, seen_generation = ?,
+				    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				WHERE id = ?
+			`, change.Title, change.ContentHash, change.SizeBytes, change.MtimeNS, generation, existing.ID); err != nil {
+				return BatchStats{}, err
+			}
+			stats.Updated++
+		} else {
+			if _, err := tx.Exec(`
+				INSERT INTO documents(
+					collection_id, relative_path, title, content_hash,
+					size_bytes, mtime_ns, active, seen_generation
+				) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+			`, collectionID, change.RelativePath, change.Title, change.ContentHash, change.SizeBytes, change.MtimeNS, generation); err != nil {
+				return BatchStats{}, err
+			}
+			stats.Inserted++
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return BatchStats{}, err
+	}
+	return stats, nil
+}
+
+// FinalizeUpdate deactivates paths not observed by a successful scan.
+func (db *DB) FinalizeUpdate(collectionID, generation int) (int, error) {
+	tx, err := db.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := verifyGeneration(tx, collectionID, generation); err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec(`
+		UPDATE documents
+		SET active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE collection_id = ? AND active = 1 AND seen_generation <> ?
+	`, collectionID, generation)
+	if err != nil {
+		return 0, err
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(removed), nil
+}

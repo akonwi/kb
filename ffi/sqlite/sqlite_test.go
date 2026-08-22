@@ -29,7 +29,7 @@ func TestFTS5BatchInsertAndRankedSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	results, err := db.Search("sqlite migrations", 10)
+	results, err := db.SearchSpike("sqlite migrations", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
