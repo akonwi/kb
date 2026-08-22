@@ -56,6 +56,11 @@ func Open(path string) (*DB, error) {
 		handle.Close()
 		return nil, err
 	}
+	if _, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys = ON"); err != nil {
+		conn.Close()
+		handle.Close()
+		return nil, err
+	}
 
 	return &DB{handle: handle, conn: conn}, nil
 }

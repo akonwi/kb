@@ -1,0 +1,319 @@
+use ard/testing
+
+use go:kb/ffi/sqlite
+use go:os
+use go:path/filepath
+
+struct Store {
+  db: mut sqlite::DB,
+}
+
+fn migrations() [sqlite::Migration] {
+  [
+    sqlite::Migration{
+      Version: 1,
+      Name: "create core tables",
+      SQL: `
+        CREATE TABLE collections (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+          root_path TEXT NOT NULL,
+          glob_pattern TEXT NOT NULL DEFAULT '**/*.md',
+          ignore_patterns TEXT NOT NULL DEFAULT '[]'
+            CHECK(json_valid(ignore_patterns) AND json_type(ignore_patterns) = 'array'),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        
+        CREATE TABLE collection_contexts (
+          id INTEGER PRIMARY KEY,
+          collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+          path_prefix TEXT NOT NULL,
+          description TEXT NOT NULL,
+          UNIQUE(collection_id, path_prefix)
+        );
+        
+        CREATE TABLE content (
+          hash TEXT PRIMARY KEY,
+          markdown TEXT NOT NULL,
+          searchable_text TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        
+        CREATE TABLE documents (
+          id INTEGER PRIMARY KEY,
+          collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+          relative_path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          content_hash TEXT NOT NULL REFERENCES content(hash),
+          size_bytes INTEGER NOT NULL,
+          mtime_ns INTEGER NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          UNIQUE(collection_id, relative_path)
+        );
+        
+        CREATE INDEX documents_collection_active
+          ON documents(collection_id, active);
+        CREATE INDEX documents_content_hash
+          ON documents(content_hash);
+        `,
+    },
+    sqlite::Migration{
+      Version: 2,
+      Name: "create full text index",
+      SQL: `
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+          path,
+          title,
+          body,
+          tokenize = 'porter unicode61'
+        );
+        
+        CREATE TRIGGER documents_fts_insert AFTER INSERT ON documents
+        WHEN new.active = 1
+        BEGIN
+          INSERT INTO documents_fts(rowid, path, title, body)
+          SELECT new.id, new.relative_path, new.title, searchable_text
+          FROM content
+          WHERE hash = new.content_hash;
+        END;
+        
+        CREATE TRIGGER documents_fts_update AFTER UPDATE ON documents
+        BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+          INSERT INTO documents_fts(rowid, path, title, body)
+          SELECT new.id, new.relative_path, new.title, searchable_text
+          FROM content
+          WHERE hash = new.content_hash AND new.active = 1;
+        END;
+        
+        CREATE TRIGGER documents_fts_delete AFTER DELETE ON documents
+        BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+        END;
+        `,
+    },
+  ]
+}
+
+fn validate_migrations(plan: [sqlite::Migration]) Void!Error {
+  mut expected = 1
+  mut invalid = 0
+  for migration in plan {
+    if invalid == 0 and migration.Version != expected {
+      invalid = migration.Version
+    }
+    expected =+ 1
+  }
+  match invalid {
+    0 => Result::ok(()),
+    _ => Result::err(Error::new("migration plan is not contiguous at version {invalid}")),
+  }
+}
+
+fn ensure_supported_version(current: Int, latest: Int) Void!Error {
+  match current > latest {
+    true => {
+      Result::err(
+        Error::new("database schema version {current} is newer than supported version {latest}"),
+      )
+    },
+    false => Result::ok(()),
+  }
+}
+
+fn open_store(path: Str) Store!Error {
+  let db = try sqlite::Open(path)
+  Result::ok(Store{db: db})
+}
+
+impl Store {
+  fn close() Void!Error {
+    self.db.Close()
+  }
+  
+  fn migrate() Int!Error {
+    let plan = migrations()
+    try validate_migrations(plan)
+    let current = try self.current_version()
+    try ensure_supported_version(current, plan.size())
+    
+    mut applied = 0
+    for migration in plan {
+      let changed = try self.db.ApplyMigration(migration)
+      if changed {
+        applied =+ 1
+      }
+    }
+    Result::ok(applied)
+  }
+  
+  fn current_version() Int!Error {
+    self.db.CurrentVersion()
+  }
+  
+  fn add_collection(name: Str, root_path: Str, glob_pattern: Str) sqlite::Collection!Error {
+    self.db.InsertCollection(name, root_path, glob_pattern, "[]")
+  }
+  
+  fn collections() [sqlite::Collection]!Error {
+    self.db.ListCollections()
+  }
+  
+  fn add_document(
+    collection_id: Int,
+    relative_path: Str,
+    title: Str,
+    hash: Str,
+    markdown: Str,
+    searchable_text: Str,
+    size_bytes: Int,
+    mtime_ns: Int,
+  ) sqlite::DocumentRecord!Error {
+    self.db.InsertDocument(
+      collection_id,
+      relative_path,
+      title,
+      hash,
+      markdown,
+      searchable_text,
+      size_bytes,
+      mtime_ns,
+    )
+  }
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+struct TempDatabase {
+  dir: Str,
+  path: Str,
+}
+
+private fn temp_database(prefix: Str) TempDatabase!Str {
+  let dir = try os::MkdirTemp("", prefix).map_err(error_message)
+  Result::ok(TempDatabase{dir: dir, path: filepath::Join(dir, "index.sqlite")})
+}
+
+test fn migrations_apply_and_survive_reopen() Void!Str {
+  let temp = try temp_database("kb-store-reopen-")
+  defer os::RemoveAll(temp.dir)
+  
+  let first = try open_store(temp.path).map_err(error_message)
+  try testing::assert((try first.migrate().map_err(error_message)) == 2, "expected two migrations")
+  try testing::assert(
+    (try first.current_version().map_err(error_message)) == 2,
+    "expected schema version 2",
+  )
+  try first.close().map_err(error_message)
+  
+  let reopened = try open_store(temp.path).map_err(error_message)
+  defer reopened.close()
+  try testing::assert(
+    (try reopened.migrate().map_err(error_message)) == 0,
+    "expected no pending migrations",
+  )
+  try testing::assert(
+    (try reopened.current_version().map_err(error_message)) == 2,
+    "expected version after reopen",
+  )
+  testing::pass()
+}
+
+test fn newer_database_version_is_rejected() Void!Str {
+  let temp = try temp_database("kb-store-future-")
+  defer os::RemoveAll(temp.dir)
+  
+  let store = try open_store(temp.path).map_err(error_message)
+  defer store.close()
+  let _ = try store.migrate().map_err(error_message)
+  let _ = try store.db.ApplyMigration(
+    sqlite::Migration{
+      Version: 3,
+      Name: "future schema",
+      SQL: "CREATE TABLE future_table (id INTEGER)",
+    },
+  ).map_err(error_message)
+  try testing::assert(store.migrate().is_err(), "expected a newer database version to be rejected")
+  testing::pass()
+}
+
+test fn failed_migration_rolls_back() Void!Str {
+  let temp = try temp_database("kb-store-rollback-")
+  defer os::RemoveAll(temp.dir)
+  
+  let store = try open_store(temp.path).map_err(error_message)
+  defer store.close()
+  let _ = try store.migrate().map_err(error_message)
+  
+  let failed = store.db.ApplyMigration(
+    sqlite::Migration{
+      Version: 3,
+      Name: "fail after creating a table",
+      SQL: `
+        CREATE TABLE should_rollback (id INTEGER PRIMARY KEY);
+        THIS IS NOT VALID SQL;
+        `,
+    },
+  )
+  try testing::assert(failed.is_err(), "expected migration failure")
+  try testing::assert(
+    (try store.current_version().map_err(error_message)) == 2,
+    "failed migration must not advance version",
+  )
+  let exists = try store.db.TableExists("should_rollback").map_err(error_message)
+  try testing::assert(not exists, "failed migration must roll back its schema changes")
+  testing::pass()
+}
+
+test fn typed_store_operations_persist_and_sync_fts() Void!Str {
+  let temp = try temp_database("kb-store-operations-")
+  defer os::RemoveAll(temp.dir)
+  
+  let store = try open_store(temp.path).map_err(error_message)
+  let _ = try store.migrate().map_err(error_message)
+  let created = try store.add_collection("notes", "/tmp/notes", "**/*.md").map_err(error_message)
+  try testing::assert(created.Name == "notes", "expected typed inserted collection")
+  try testing::assert(
+    store.add_collection("NOTES", "/tmp/other", "**/*.md").is_err(),
+    "collection names must be case-insensitively unique",
+  )
+  
+  let document = try store.add_document(
+    created.ID,
+    "database.md",
+    "SQLite migrations",
+    "content-hash",
+    "# SQLite migrations",
+    "SQLite schema migrations use transactions.",
+    19,
+    123,
+  ).map_err(error_message)
+  try testing::assert(document.CollectionID == created.ID, "expected typed document")
+  let matches = try store.db.Search("sqlite migrations", 10).map_err(error_message)
+  try testing::assert(matches.size() == 1, "expected trigger-maintained FTS result")
+  try store.close().map_err(error_message)
+  
+  let reopened = try open_store(temp.path).map_err(error_message)
+  defer reopened.close()
+  let collections = try reopened.collections().map_err(error_message)
+  try testing::assert(collections.size() == 1, "expected collection after reopen")
+  try testing::assert(
+    collections.at(
+      0,
+    ).map(fn(collection: sqlite::Collection) Str {
+      collection.RootPath
+    }).or("") == "/tmp/notes",
+    "expected persisted collection path",
+  )
+  let reopened_matches = try reopened.db.Search("sqlite migrations", 10).map_err(error_message)
+  try testing::assert(reopened_matches.size() == 1, "expected FTS result after reopen")
+  try reopened.db.DeleteCollection(created.ID).map_err(error_message)
+  let deleted_matches = try reopened.db.Search("sqlite migrations", 10).map_err(error_message)
+  try testing::assert(deleted_matches.size() == 0, "collection cascade must remove FTS rows")
+  testing::pass()
+}
