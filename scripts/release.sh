@@ -24,7 +24,6 @@ if [[ ! $VERSION =~ $SEMVER_PATTERN ]]; then
   echo "Error: version must be a v-prefixed semantic version without build metadata (for example, v0.1.0 or v1.0.0-rc.1)" >&2
   exit 2
 fi
-SEMVER=${VERSION#v}
 if [[ $SKIP_LINUX_SMOKE == true && $DRY_RUN == false ]]; then
   echo "Error: --skip-linux-smoke is allowed only with --dry-run" >&2
   exit 2
@@ -374,7 +373,6 @@ cat > "$FORMULA" <<FORMULA
 class Kb < Formula
   desc "Fast, private, local knowledge base for Markdown"
   homepage "https://github.com/akonwi/kb"
-  version "$SEMVER"
   license "MIT"
 
   if OS.mac?

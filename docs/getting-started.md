@@ -2,9 +2,22 @@
 
 `kb` indexes local Markdown directories into a private SQLite FTS5 database. It runs entirely on your machine and does not require a daemon, model, embedding service, or network connection after the binary is built.
 
-## Install from source
+## Install
 
-Release archives are not published yet. Building currently requires:
+### Homebrew
+
+On macOS or Linux:
+
+```sh
+brew install akonwi/tap/kb
+kb version
+```
+
+Homebrew selects the arm64 or amd64 package for the current system. Prebuilt archives and checksums are also available from [GitHub Releases](https://github.com/akonwi/kb/releases).
+
+### From source
+
+Building requires:
 
 - [Ard](https://ard.run) 0.38 or newer
 - Go 1.25 or newer

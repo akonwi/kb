@@ -2,8 +2,6 @@
 
 A fast, private, local knowledge base for Markdown. `kb` indexes directories into SQLite FTS5, provides deterministic lexical search, and retrieves the original source without requiring embeddings, inference, a daemon, or a hosted service.
 
-> `kb` is currently pre-release. It can be built and used from source; packaged release binaries are not published yet.
-
 ## Features
 
 - Named directory collections with glob and ignore rules
@@ -19,19 +17,25 @@ A fast, private, local knowledge base for Markdown. `kb` indexes directories int
 
 ## Install
 
-Building currently requires [Ard](https://ard.run) 0.38 or newer and Go 1.25 or newer.
+### Homebrew
 
-On macOS or Linux:
+```sh
+brew install akonwi/tap/kb
+kb version
+```
+
+Homebrew packages are available for macOS and Linux on arm64 and amd64. Prebuilt archives and checksums are also available from [GitHub Releases](https://github.com/akonwi/kb/releases).
+
+### From source
+
+Building requires [Ard](https://ard.run) 0.38 or newer and Go 1.25 or newer:
 
 ```sh
 cd /path/to/kb
 ard build main.ard --out kb
 mkdir -p ~/.local/bin
 install -m 755 kb ~/.local/bin/kb
-kb --version
 ```
-
-On Windows, build with `ard build main.ard --out kb.exe` and place `kb.exe` in a directory on `PATH`.
 
 See [Getting started](docs/getting-started.md) for installation details and your first collection.
 
