@@ -49,6 +49,10 @@ test fn collection_operations_use_canonical_directories() Void!Str {
   let created = try create(database, "notes", root, "**/*.md", ["archive/**"]).map_err(error_message)
   let canonical = try fs::CanonicalDirectory(root).map_err(error_message)
   try testing::assert(created.RootPath == canonical, "expected canonical root")
+  try testing::assert(
+    create(database, "invalid/name", root, "**/*.md", []).is_err(),
+    "collection names must remain valid virtual-path prefixes",
+  )
   try testing::assert(created.IgnorePatterns.size() == 1, "expected typed ignore patterns")
   
   let found = try show(database, "NOTES").map_err(error_message)

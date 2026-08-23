@@ -1,0 +1,484 @@
+use go:encoding/json
+use go:fmt
+use kb/app
+use kb/collections
+use kb/config
+use go:kb/ffi/sqlite
+use kb/index
+use kb/maintenance
+use kb/retrieval
+use kb/search
+use kb/store
+use go:os
+use go:strconv
+use go:strings
+
+let usage = `
+  kb — a fast local knowledge base
+  
+  Usage:
+    kb collection add NAME ROOT [--glob PATTERN] [--ignore PATTERN ...]
+    kb collection list [--json]
+    kb collection show NAME [--json]
+    kb collection remove NAME
+    kb update [COLLECTION] [--verify]
+    kb search QUERY... [--collection NAME ...] [--limit N] [--json]
+    kb get ID|COLLECTION/PATH [--lines START[:END]] [--number] [--json]
+    kb status [--json]
+    kb cleanup [--vacuum] [--json]
+    kb doctor [--json]
+    kb config export [FILE|-]
+    kb config import FILE [--replace]
+  
+  Environment:
+    KB_DATABASE  Override the SQLite database path.
+  `
+
+fn usage_error(message: Str) Error {
+  Error::new("usage: {message}")
+}
+
+fn reject_usage(message: Str) Void!Error {
+  Result::err(usage_error(message))
+}
+
+fn require_arg(args: [Str], index: Int, label: Str) Str!Error {
+  match args.at(index) {
+    value => Result::ok(value),
+    _ => Result::err(usage_error("missing {label}")),
+  }
+}
+
+fn print_json_bytes(bytes: [Byte]) {
+  fmt::Println(fmt::Sprintf("%s", bytes))
+}
+
+fn optional_json(args: [Str], start: Int, command: Str) Bool!Error {
+  match args.size() == start {
+    true => Result::ok(false),
+    false => {
+      match args.size() == start + 1 and args.at(start).or("") == "--json" {
+        true => Result::ok(true),
+        false => Result::err(usage_error("{command} accepts only --json")),
+      }
+    },
+  }
+}
+
+fn safe(value: Str) Str {
+  app::safe_terminal(value)
+}
+
+struct CollectionView {
+  name: Str,
+  root_path: Str,
+  glob_pattern: Str,
+  ignore_patterns: [Str],
+  created_at: Str,
+  updated_at: Str,
+}
+
+fn collection_view(collection: sqlite::Collection) CollectionView {
+  let ignores: mut [Str] = mut []
+  for pattern in collection.IgnorePatterns {
+    ignores.push(pattern)
+  }
+  CollectionView{
+    name: collection.Name,
+    root_path: collection.RootPath,
+    glob_pattern: collection.GlobPattern,
+    ignore_patterns: ignores.@,
+    created_at: collection.CreatedAt,
+    updated_at: collection.UpdatedAt,
+  }
+}
+
+fn command_collection(database: store::Store, args: [Str]) Void!Error {
+  let action = try require_arg(args, 2, "collection action")
+  match action {
+    "add" => {
+      let name = try require_arg(args, 3, "collection name")
+      let root = try require_arg(args, 4, "collection root")
+      mut glob = "**/*.md"
+      let ignores: mut [Str] = mut []
+      mut index_value = 5
+      while index_value < args.size() {
+        let option = args.at(index_value).expect("bounded argument")
+        match option {
+          "--glob" => {
+            glob = try require_arg(args, index_value + 1, "glob pattern")
+            index_value =+ 2
+          },
+          "--ignore" => {
+            ignores.push(try require_arg(args, index_value + 1, "ignore pattern"))
+            index_value =+ 2
+          },
+          _ => try reject_usage("unknown collection add option: {option}"),
+        }
+      }
+      let created = try collections::create(database, name, root, glob, ignores.@)
+      fmt::Println("added {safe(created.Name)} ({safe(created.RootPath)})")
+      Result::ok(())
+    },
+    "list" => {
+      let as_json = try optional_json(args, 3, "collection list")
+      let source = try collections::list(database)
+      let output: mut [CollectionView] = mut []
+      for item in source {
+        output.push(collection_view(item))
+      }
+      match as_json {
+        true => print_json_bytes(try json::Marshal(output.@)),
+        false => {
+          for item in output {
+            fmt::Println("{safe(item.name)}\t{safe(item.root_path)}\t{safe(item.glob_pattern)}")
+          }
+        },
+      }
+      Result::ok(())
+    },
+    "show" => {
+      let name = try require_arg(args, 3, "collection name")
+      let lookup = try collections::show(database, name)
+      let found = match lookup.Found {
+        true => Result::ok(lookup.Collection),
+        false => Result::err(Error::new("collection not found: {name}")),
+      }
+      let item = collection_view(try found)
+      let as_json = try optional_json(args, 4, "collection show")
+      match as_json {
+        true => print_json_bytes(try json::Marshal(item)),
+        false => {
+          fmt::Println("Name: {safe(item.name)}")
+          fmt::Println("Root: {safe(item.root_path)}")
+          fmt::Println("Glob: {safe(item.glob_pattern)}")
+          for pattern in item.ignore_patterns {
+            fmt::Println("Ignore: {safe(pattern)}")
+          }
+        },
+      }
+      Result::ok(())
+    },
+    "remove" => {
+      let name = try require_arg(args, 3, "collection name")
+      if args.size() != 4 {
+        try reject_usage("collection remove accepts only NAME")
+      }
+      match try collections::remove(database, name) {
+        true => {
+          fmt::Println("removed {safe(name)}")
+          Result::ok(())
+        },
+        false => Result::err(Error::new("collection not found: {name}")),
+      }
+    },
+    _ => Result::err(usage_error("unknown collection action: {action}")),
+  }
+}
+
+fn print_update(name: Str, stats: index::UpdateStats) {
+  fmt::Println(
+    "{safe(name)}: walked={stats.walked} read={stats.read} unchanged={stats.unchanged} inserted={stats.inserted} updated={stats.updated} removed={stats.removed}",
+  )
+}
+
+fn command_update(database: store::Store, args: [Str]) Void!Error {
+  mut name = ""
+  mut verify = false
+  for argument, argument_index in args {
+    if argument_index >= 2 {
+      match argument {
+        "--verify" => { verify = true },
+        _ => {
+          match name.is_empty() {
+            true => { name = argument },
+            false => try reject_usage("unexpected update argument: {argument}"),
+          }
+        },
+      }
+    }
+  }
+  let options = index::default_options(verify)
+  match name.is_empty() {
+    false => {
+      let lookup = try collections::show(database, name)
+      let collection = match lookup.Found {
+        true => Result::ok(lookup.Collection),
+        false => Result::err(Error::new("collection not found: {name}")),
+      }
+      let selected = try collection
+      print_update(selected.Name, try index::update(database, selected, options))
+    },
+    true => {
+      let all = try collections::list(database)
+      for collection in all {
+        print_update(collection.Name, try index::update(database, collection, options))
+      }
+    },
+  }
+  Result::ok(())
+}
+
+fn command_search(database: store::Store, args: [Str]) Void!Error {
+  mut query = ""
+  let selected: mut [Str] = mut []
+  mut limit = 10
+  mut as_json = false
+  mut argument_index = 2
+  while argument_index < args.size() {
+    let argument = args.at(argument_index).expect("bounded argument")
+    match argument {
+      "--collection" => {
+        selected.push(try require_arg(args, argument_index + 1, "collection filter"))
+        argument_index =+ 2
+      },
+      "--limit" => {
+        let value = try require_arg(args, argument_index + 1, "search limit")
+        limit = try strconv::Atoi(
+          value,
+        ).map_err(fn(error: Error) Error {
+          usage_error(error.error())
+        })
+        argument_index =+ 2
+      },
+      "--json" => {
+        as_json = true
+        argument_index =+ 1
+      },
+      _ => {
+        match strings::HasPrefix(argument, "--") {
+          true => try reject_usage("unknown search option: {argument}"),
+          false => {
+            if not query.is_empty() {
+              query = "{query} "
+            }
+            query = "{query}{argument}"
+            argument_index =+ 1
+          },
+        }
+      },
+    }
+  }
+  let results = try search::search(database, query, search::SearchOptions{collections: selected.@, limit: limit})
+  match as_json {
+    true => fmt::Println(try search::format_json(results)),
+    false => fmt::Println(search::format_human(results)),
+  }
+  Result::ok(())
+}
+
+struct LineRange {
+  start: Int,
+  end: Int,
+}
+
+fn parse_line_number(value: Str) Int!Error {
+  strconv::Atoi(
+    value,
+  ).map_err(fn(error: Error) Error {
+    usage_error("invalid line number: {error.error()}")
+  })
+}
+
+fn parse_line_range(value: Str) LineRange!Error {
+  let parts = strings::Split(value, ":")
+  match parts.size() {
+    1 => {
+      let line = try parse_line_number(parts.at(0).expect("one line part"))
+      Result::ok(LineRange{start: line, end: line})
+    },
+    2 => {
+      Result::ok(
+        LineRange{
+          start: try parse_line_number(parts.at(0).expect("range start")),
+          end: try parse_line_number(parts.at(1).expect("range end")),
+        },
+      )
+    },
+    _ => Result::err(usage_error("line range must be START or START:END")),
+  }
+}
+
+fn command_get(database: store::Store, args: [Str]) Void!Error {
+  let selector = try require_arg(args, 2, "document ID or virtual path")
+  mut range = LineRange{start: 0, end: 0}
+  mut numbered = false
+  mut as_json = false
+  mut argument_index = 3
+  while argument_index < args.size() {
+    let argument = args.at(argument_index).expect("bounded argument")
+    match argument {
+      "--lines" => {
+        range = try parse_line_range(try require_arg(args, argument_index + 1, "line range"))
+        argument_index =+ 2
+      },
+      "--number" => {
+        numbered = true
+        argument_index =+ 1
+      },
+      "--json" => {
+        as_json = true
+        argument_index =+ 1
+      },
+      _ => try reject_usage("unknown get option: {argument}"),
+    }
+  }
+  let document = try retrieval::get(
+    database,
+    selector,
+    retrieval::GetOptions{
+      start_line: range.start,
+      end_line: range.end,
+      numbered: numbered,
+    },
+  )
+  match as_json {
+    true => print_json_bytes(try json::Marshal(document)),
+    false => fmt::Print(document.content),
+  }
+  Result::ok(())
+}
+
+fn command_status(database: store::Store, args: [Str]) Void!Error {
+  let as_json = try optional_json(args, 2, "status")
+  let result = try maintenance::status(database)
+  match as_json {
+    true => print_json_bytes(try json::Marshal(result)),
+    false => {
+      fmt::Println(
+        "collections={result.database.collections} active={result.database.active_documents} inactive={result.database.inactive_documents} content_bytes={result.database.content_bytes}",
+      )
+      for collection in result.collections {
+        fmt::Println(
+          "{safe(collection.name)}\tactive={collection.active_documents}\tinactive={collection.inactive_documents}\tbytes={collection.indexed_bytes}\t{safe(collection.root_path)}",
+        )
+      }
+    },
+  }
+  Result::ok(())
+}
+
+fn command_cleanup(database: store::Store, args: [Str]) Void!Error {
+  mut vacuum = false
+  mut as_json = false
+  for argument, argument_index in args {
+    if argument_index >= 2 {
+      match argument {
+        "--vacuum" => { vacuum = true },
+        "--json" => { as_json = true },
+        _ => try reject_usage("unknown cleanup option: {argument}"),
+      }
+    }
+  }
+  let result = try maintenance::cleanup(database, vacuum)
+  match as_json {
+    true => print_json_bytes(try json::Marshal(result)),
+    false => {
+      fmt::Println(
+        "removed_documents={result.inactive_documents} removed_content={result.orphaned_content} vacuumed={result.vacuumed}",
+      )
+    },
+  }
+  if not result.warning.is_empty() {
+    fmt::Fprintln(os::Stderr, "warning: {safe(result.warning)}")
+  }
+  Result::ok(())
+}
+
+fn command_doctor(database: store::Store, args: [Str]) Void!Error {
+  let as_json = try optional_json(args, 2, "doctor")
+  let checks = try maintenance::doctor(database)
+  match as_json {
+    true => print_json_bytes(try json::Marshal(checks)),
+    false => {
+      for check in checks {
+        let mark = match check.ok {
+          true => "ok",
+          false => "FAIL",
+        }
+        fmt::Println("{mark}\t{safe(check.name)}\t{safe(check.detail)}")
+      }
+    },
+  }
+  match maintenance::healthy(checks) {
+    true => Result::ok(()),
+    false => Result::err(Error::new("doctor found unhealthy checks")),
+  }
+}
+
+fn command_config(database: store::Store, args: [Str]) Void!Error {
+  let action = try require_arg(args, 2, "config action")
+  match action {
+    "export" => {
+      let output = args.at(3).or("-")
+      if args.size() > 4 {
+        try reject_usage("config export accepts at most one output file")
+      }
+      let content = try config::export_config(database)
+      match output {
+        "-" => fmt::Print(content),
+        _ => try os::WriteFile(output, mut content.bytes(), 420),
+      }
+      Result::ok(())
+    },
+    "import" => {
+      let path = try require_arg(args, 3, "config file")
+      mut replace = false
+      if args.size() > 5 {
+        try reject_usage("config import accepts only FILE and --replace")
+      }
+      if args.size() > 4 {
+        let option = args.at(4).expect("bounded argument")
+        match option {
+          "--replace" => { replace = true },
+          _ => try reject_usage("unknown config import option: {option}"),
+        }
+      }
+      let bytes = try os::ReadFile(path)
+      let count = try config::import_config(database, fmt::Sprintf("%s", bytes), replace)
+      fmt::Println("imported {count} collection(s)")
+      Result::ok(())
+    },
+    _ => Result::err(usage_error("unknown config action: {action}")),
+  }
+}
+
+fn run(args: [Str]) Void!Error {
+  let command = args.at(1).or("help")
+  match command {
+    "help" => {
+      fmt::Print(usage)
+      Result::ok(())
+    },
+    "--help" => {
+      fmt::Print(usage)
+      Result::ok(())
+    },
+    "-h" => {
+      fmt::Print(usage)
+      Result::ok(())
+    },
+    "--version" => {
+      fmt::Println("{app::name()} 0.1.0")
+      Result::ok(())
+    },
+    _ => {
+      let path = try app::database_path()
+      try app::ensure_database_directory(path)
+      let database = try store::open_store(path)
+      defer database.close()
+      let _ = try database.migrate()
+      match command {
+        "collection" => command_collection(database, args),
+        "update" => command_update(database, args),
+        "search" => command_search(database, args),
+        "get" => command_get(database, args),
+        "status" => command_status(database, args),
+        "cleanup" => command_cleanup(database, args),
+        "doctor" => command_doctor(database, args),
+        "config" => command_config(database, args),
+        _ => Result::err(usage_error("unknown command: {command}")),
+      }
+    },
+  }
+}

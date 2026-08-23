@@ -1,0 +1,160 @@
+use ard/testing
+
+use go:kb/ffi/sqlite
+use kb/store
+use go:os
+
+struct GetOptions {
+  start_line: Int,
+  end_line: Int,
+  numbered: Bool,
+}
+
+fn default_options() GetOptions {
+  GetOptions{
+    start_line: 0,
+    end_line: 0,
+    numbered: false,
+  }
+}
+
+struct Document {
+  id: Str,
+  content_hash: Str,
+  virtual_path: Str,
+  collection: Str,
+  path: Str,
+  title: Str,
+  content: Str,
+  size_bytes: Int,
+  modified_at: Str,
+}
+
+fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::RetrievedDocument!Error {
+  match lookup.Ambiguous {
+    true => Result::err(Error::new("document ID is ambiguous: {selector}")),
+    false => {
+      match lookup.Found {
+        true => Result::ok(lookup.Document),
+        false => Result::err(Error::new("document not found: {selector}")),
+      }
+    },
+  }
+}
+
+fn get(database: store::Store, selector: Str, options: GetOptions) Document!Error {
+  let lookup = try database.db.LookupDocument(selector)
+  let source = try require_document(lookup, selector)
+  let content = try sqlite::RenderLines(source.Markdown, options.start_line, options.end_line, options.numbered)
+  Result::ok(
+    Document{
+      id: source.ID,
+      content_hash: source.ContentHash,
+      virtual_path: source.VirtualPath,
+      collection: source.Collection,
+      path: source.RelativePath,
+      title: source.Title,
+      content: content,
+      size_bytes: source.SizeBytes,
+      modified_at: source.ModifiedAt,
+    },
+  )
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn retrieves_by_virtual_path_and_stable_content_id() Void!Str {
+  let directory = try os::MkdirTemp("", "kb-retrieval-").map_err(error_message)
+  defer os::RemoveAll(directory)
+  let database = try store::open_store("{directory}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let first = try database.add_collection("alpha", "/tmp/alpha", "**/*.md").map_err(error_message)
+  let second = try database.add_collection("beta", "/tmp/beta", "**/*.md").map_err(error_message)
+  let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+  let _ = try database.add_document(
+    first.ID,
+    "guide.md",
+    "Guide",
+    hash,
+    "one\ntwo\nthree",
+    "one two three",
+    13,
+    1,
+  ).map_err(error_message)
+  let _ = try database.add_document(
+    second.ID,
+    "alias.md",
+    "Alias",
+    hash,
+    "one\ntwo\nthree",
+    "one two three",
+    13,
+    1,
+  ).map_err(error_message)
+  
+  let path_document = try get(database, "alpha/guide.md", default_options()).map_err(error_message)
+  try testing::assert(path_document.id == "abcdef1234567890", "expected short content ID")
+  try testing::assert(path_document.content == "one\ntwo\nthree", "expected unchanged source")
+  let id_document = try get(
+    database,
+    "abcdef123456",
+    GetOptions{
+      start_line: 2,
+      end_line: 3,
+      numbered: true,
+    },
+  ).map_err(error_message)
+  try testing::assert(id_document.content == "     2  two\n     3  three", "expected numbered line range")
+  try testing::assert(
+    get(database, "alpha/missing.md", default_options()).is_err(),
+    "expected missing path",
+  )
+  testing::pass()
+}
+
+test fn rejects_ambiguous_or_invalid_content_ids_and_ranges() Void!Str {
+  let directory = try os::MkdirTemp("", "kb-retrieval-ambiguous-").map_err(error_message)
+  defer os::RemoveAll(directory)
+  let database = try store::open_store("{directory}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try database.add_collection("notes", "/tmp/notes", "**/*.md").map_err(error_message)
+  let _ = try database.add_document(
+    collection.ID,
+    "one.md",
+    "One",
+    "12345678aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "one",
+    "one",
+    3,
+    1,
+  ).map_err(error_message)
+  let _ = try database.add_document(
+    collection.ID,
+    "two.md",
+    "Two",
+    "12345678bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "two",
+    "two",
+    3,
+    1,
+  ).map_err(error_message)
+  try testing::assert(get(database, "12345678", default_options()).is_err(), "expected ambiguous ID")
+  try testing::assert(get(database, "not-an-id", default_options()).is_err(), "expected invalid ID")
+  try testing::assert(
+    get(
+      database,
+      "notes/one.md",
+      GetOptions{
+        start_line: 2,
+        end_line: 2,
+        numbered: false,
+      },
+    ).is_err(),
+    "expected out-of-range lines",
+  )
+  testing::pass()
+}

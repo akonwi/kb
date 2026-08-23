@@ -1,0 +1,150 @@
+use ard/testing
+
+use kb/store
+use go:os
+
+struct DatabaseStatus {
+  collections: Int,
+  active_documents: Int,
+  inactive_documents: Int,
+  content_rows: Int,
+  content_bytes: Int,
+  fts_rows: Int,
+}
+
+struct CollectionStatus {
+  name: Str,
+  root_path: Str,
+  active_documents: Int,
+  inactive_documents: Int,
+  indexed_bytes: Int,
+  updated_at: Str,
+}
+
+struct Status {
+  database: DatabaseStatus,
+  collections: [CollectionStatus],
+}
+
+fn status(database: store::Store) Status!Error {
+  let source = try database.db.ReadStatus()
+  let collections: mut [CollectionStatus] = mut []
+  for collection in source.Collections {
+    collections.push(
+      CollectionStatus{
+        name: collection.Name,
+        root_path: collection.RootPath,
+        active_documents: collection.ActiveDocuments,
+        inactive_documents: collection.InactiveDocuments,
+        indexed_bytes: collection.IndexedBytes,
+        updated_at: collection.UpdatedAt,
+      },
+    )
+  }
+  Result::ok(
+    Status{
+      database: DatabaseStatus{
+        collections: source.Database.Collections,
+        active_documents: source.Database.ActiveDocuments,
+        inactive_documents: source.Database.InactiveDocuments,
+        content_rows: source.Database.ContentRows,
+        content_bytes: source.Database.ContentBytes,
+        fts_rows: source.Database.FTSRows,
+      },
+      collections: collections.@,
+    },
+  )
+}
+
+struct CleanupResult {
+  inactive_documents: Int,
+  orphaned_content: Int,
+  vacuumed: Bool,
+  warning: Str,
+}
+
+fn cleanup(database: store::Store, vacuum: Bool) CleanupResult!Error {
+  let result = try database.db.Cleanup(vacuum)
+  Result::ok(
+    CleanupResult{
+      inactive_documents: result.InactiveDocuments,
+      orphaned_content: result.OrphanedContent,
+      vacuumed: result.Vacuumed,
+      warning: result.Warning,
+    },
+  )
+}
+
+struct Check {
+  name: Str,
+  ok: Bool,
+  detail: Str,
+}
+
+fn doctor(database: store::Store) [Check]!Error {
+  let source = try database.db.Doctor()
+  let checks: mut [Check] = mut []
+  for check in source {
+    checks.push(
+      Check{
+        name: check.Name,
+        ok: check.OK,
+        detail: check.Detail,
+      },
+    )
+  }
+  Result::ok(checks.@)
+}
+
+fn healthy(checks: [Check]) Bool {
+  mut result = true
+  for check in checks {
+    if not check.ok {
+      result = false
+    }
+  }
+  result
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn reports_status_cleans_stale_rows_and_runs_doctor() Void!Str {
+  let directory = try os::MkdirTemp("", "kb-maintenance-").map_err(error_message)
+  defer os::RemoveAll(directory)
+  let root = try os::MkdirTemp("", "kb-maintenance-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database = try store::open_store("{directory}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try database.add_collection("notes", root, "**/*.md").map_err(error_message)
+  let _ = try database.add_document(
+    collection.ID,
+    "stale.md",
+    "Stale",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stale",
+    "stale",
+    5,
+    1,
+  ).map_err(error_message)
+  let generation = try database.db.BeginUpdate(collection.ID).map_err(error_message)
+  let _ = try database.db.FinalizeUpdate(collection.ID, generation).map_err(error_message)
+  
+  let before = try status(database).map_err(error_message)
+  try testing::assert(before.database.inactive_documents == 1, "expected inactive document")
+  let removed = try cleanup(database, false).map_err(error_message)
+  try testing::assert(
+    removed.inactive_documents == 1 and removed.orphaned_content == 1,
+    "expected stale document and content cleanup",
+  )
+  let after = try status(database).map_err(error_message)
+  try testing::assert(
+    after.database.inactive_documents == 0 and after.database.content_rows == 0,
+    "expected clean status",
+  )
+  let checks = try doctor(database).map_err(error_message)
+  try testing::assert(healthy(checks), "expected healthy database and collection root")
+  testing::pass()
+}

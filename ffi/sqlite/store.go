@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // MaxDocumentBytes bounds original content retained by the store.
@@ -59,8 +60,20 @@ func scanCollection(scanner interface{ Scan(...any) error }) (Collection, error)
 	return collection, nil
 }
 
+func validateCollectionName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return "", fmt.Errorf("collection name must be nonempty and contain no path separators")
+	}
+	return name, nil
+}
+
 // InsertCollection creates and returns a collection.
 func (db *DB) InsertCollection(name, rootPath, globPattern string, ignorePatterns []string) (Collection, error) {
+	name, err := validateCollectionName(name)
+	if err != nil {
+		return Collection{}, err
+	}
 	ignoreJSON, err := json.Marshal(ignorePatterns)
 	if err != nil {
 		return Collection{}, err

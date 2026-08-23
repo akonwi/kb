@@ -1,6 +1,22 @@
 use go:fmt
 use kb/app
+use kb/cli
+use go:os
+use go:strings
 
 fn main() {
-  fmt::Println("{app::name()}: {app::description()}")
+  try cli::run(os::Args) -> err {
+    let message = err.error()
+    match strings::HasPrefix(message, "usage: ") {
+      true => {
+        fmt::Fprintln(os::Stderr, app::safe_terminal(message))
+        fmt::Fprintln(os::Stderr, "Run 'kb help' for usage.")
+        os::Exit(2)
+      },
+      false => {
+        fmt::Fprintln(os::Stderr, "error: {app::safe_terminal(message)}")
+        os::Exit(1)
+      },
+    }
+  }
 }

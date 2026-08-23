@@ -17,8 +17,19 @@ ard build main.ard --out kb
 Run from source with:
 
 ```sh
-ard run main.ard
+ard run main.ard -- help
 ```
+
+Build and try the CLI:
+
+```sh
+ard build main.ard --out kb
+./kb collection add notes ~/Notes
+./kb update notes
+./kb search sqlite
+```
+
+The database defaults to `~/.local/share/kb/index.sqlite`; override it with `KB_DATABASE`. See the [CLI reference](docs/cli.md) for all commands and output contracts.
 
 Generated files are written under `ard-out/` and are not committed.
 

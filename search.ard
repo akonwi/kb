@@ -25,7 +25,8 @@ fn default_options() SearchOptions {
 }
 
 struct Match {
-  document_id: Int,
+  id: Str,
+  virtual_path: Str,
   collection: Str,
   path: Str,
   title: Str,
@@ -154,7 +155,8 @@ fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Er
   for row in rows {
     matches.push(
       Match{
-        document_id: row.DocumentID,
+        id: row.ID,
+        virtual_path: row.VirtualPath,
         collection: row.Collection,
         path: row.RelativePath,
         title: row.Title,
@@ -324,7 +326,8 @@ test fn searches_ranked_filtered_documents_with_context() Void!Str {
 test fn formats_human_and_json_results() Void!Str {
   let matches = [
     Match{
-      document_id: 1,
+      id: "abcdef1234567890",
+      virtual_path: "notes/database.md",
       collection: "notes",
       path: "database.md",
       title: "SQLite",
@@ -343,7 +346,8 @@ test fn formats_human_and_json_results() Void!Str {
   )
   let hostile = [
     Match{
-      document_id: 2,
+      id: "defabc1234567890",
+      virtual_path: "notes/safe.md",
       collection: "notes",
       path: "safe.md",
       title: "unsafe\x1b]52;clipboard",

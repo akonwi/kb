@@ -11,6 +11,8 @@ const maxSearchMarkdownBytes = 64 * 1024 * 1024
 
 type IndexSearchRow struct {
 	DocumentID   int
+	ID           string
+	VirtualPath  string
 	CollectionID int
 	Collection   string
 	RelativePath string
@@ -120,6 +122,8 @@ func (db *DB) SearchIndex(query string, collectionIDs []int, limit int) ([]Index
 		if totalMarkdownBytes > maxSearchMarkdownBytes {
 			return nil, fmt.Errorf("search results exceed %d bytes of original content", maxSearchMarkdownBytes)
 		}
+		result.ID = ShortContentID(result.ContentHash)
+		result.VirtualPath = result.Collection + "/" + result.RelativePath
 		results = append(results, result)
 	}
 	if err := rows.Err(); err != nil {

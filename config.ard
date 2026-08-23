@@ -1,0 +1,102 @@
+use ard/testing
+
+use go:kb/ffi/fs
+use kb/store
+use go:os
+use go:strings
+
+fn export_config(database: store::Store) Str!Error {
+  database.db.ExportConfigJSON()
+}
+
+fn import_config(database: store::Store, content: Str, replace: Bool) Int!Error {
+  database.db.ImportConfigJSON(content, replace)
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn exports_and_atomically_imports_collection_configuration() Void!Str {
+  let directory = try os::MkdirTemp("", "kb-config-").map_err(error_message)
+  defer os::RemoveAll(directory)
+  let root = try os::MkdirTemp("", "kb-config-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let source = try store::open_store("{directory}/source.sqlite").map_err(error_message)
+  defer source.close()
+  let _ = try source.migrate().map_err(error_message)
+  let canonical_root = try fs::CanonicalDirectory(root).map_err(error_message)
+  let collection = try source.db.InsertCollection(
+    "notes",
+    canonical_root,
+    "**/*.md",
+    mut ["archive/**"],
+  ).map_err(error_message)
+  try source.db.UpsertCollectionContext(collection.ID, "guides", "Guide context").map_err(error_message)
+  let exported = try export_config(source).map_err(error_message)
+  try testing::assert(
+    exported.contains("\"version\": 1") and exported.contains("Guide context"),
+    "expected versioned collection configuration",
+  )
+  
+  let target = try store::open_store("{directory}/target.sqlite").map_err(error_message)
+  defer target.close()
+  let _ = try target.migrate().map_err(error_message)
+  try testing::assert(
+    (try import_config(target, exported, false).map_err(error_message)) == 1,
+    "expected one imported collection",
+  )
+  let round_trip = try export_config(target).map_err(error_message)
+  try testing::assert(round_trip == exported, "expected deterministic round trip")
+  let imported_collection = try target.db.LookupCollection("notes").map_err(error_message)
+  let _ = try target.add_document(
+    imported_collection.Collection.ID,
+    "old.md",
+    "Old",
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "old",
+    "old",
+    3,
+    1,
+  ).map_err(error_message)
+  let changed_rules = strings::ReplaceAll(exported, "**/*.md", "**/*.txt")
+  let _ = try import_config(target, changed_rules, false).map_err(error_message)
+  let changed_status = try target.db.ReadStatus().map_err(error_message)
+  try testing::assert(
+    changed_status.Database.ActiveDocuments == 0 and changed_status.Database.InactiveDocuments == 0,
+    "changed indexing rules must invalidate old documents",
+  )
+  try testing::assert(
+    import_config(target, "{{\"version\":1,\"collections\":[],\"unknown\":true}}", false).is_err(),
+    "expected unknown-field rejection",
+  )
+  try testing::assert(
+    import_config(target, "{{\"version\":1}}", true).is_err(),
+    "replacement requires an explicit collections array",
+  )
+  try testing::assert(
+    import_config(target, "{{\"version\":1,\"collections\":null}}", true).is_err(),
+    "replacement rejects a null collections value",
+  )
+  try testing::assert(
+    import_config(
+      target,
+      "{{\"version\":1,\"collections\":[{{\"name\":\"bad\",\"glob_pattern\":\"**/*.md\",\"ignore_patterns\":[],\"contexts\":[]}}]}}",
+      false,
+    ).is_err(),
+    "collection root_path is required",
+  )
+  try testing::assert(
+    (try target.collections().map_err(error_message)).size() == 1,
+    "failed import must not mutate current configuration",
+  )
+  try testing::assert(
+    (try import_config(target, "{{\"version\":1,\"collections\":[]}}", true).map_err(error_message)) == 0,
+    "expected empty replacement",
+  )
+  try testing::assert(
+    (try target.collections().map_err(error_message)).size() == 0,
+    "expected replacement removal",
+  )
+  testing::pass()
+}

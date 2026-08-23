@@ -1,7 +1,32 @@
+use go:os
+use go:path/filepath
+use go:regexp
+
+let terminal_controls: mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
+
 fn name() Str {
   "kb"
 }
 
 fn description() Str {
   "A fast local knowledge base"
+}
+
+fn database_path() Str!Error {
+  let configured = os::Getenv("KB_DATABASE")
+  match configured.is_empty() {
+    false => Result::ok(configured),
+    true => {
+      let home = try os::UserHomeDir()
+      Result::ok(filepath::Join(home, ".local", "share", "kb", "index.sqlite"))
+    },
+  }
+}
+
+fn ensure_database_directory(path: Str) Void!Error {
+  os::MkdirAll(filepath::Dir(path), 448)
+}
+
+fn safe_terminal(value: Str) Str {
+  terminal_controls.ReplaceAllString(value, "�")
 }
