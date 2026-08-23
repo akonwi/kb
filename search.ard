@@ -155,8 +155,8 @@ fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Er
   for row in rows {
     matches.push(
       Match{
-        id: row.ID,
-        virtual_path: row.VirtualPath,
+        id: row.ContentHash.slice(0, 16).or(row.ContentHash),
+        virtual_path: "{row.Collection}/{row.RelativePath}",
         collection: row.Collection,
         path: row.RelativePath,
         title: row.Title,

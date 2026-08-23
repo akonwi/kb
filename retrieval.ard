@@ -1,8 +1,10 @@
 use ard/testing
 
+use go:fmt
 use go:kb/ffi/sqlite
 use kb/store
 use go:os
+use go:strings
 
 struct GetOptions {
   start_line: Int,
@@ -30,6 +32,48 @@ struct Document {
   modified_at: Str,
 }
 
+fn render_selected_lines(lines: [Str], first: Int, last: Int, numbered: Bool) Str {
+  mut output = ""
+  for line, index in lines {
+    let line_number = index + 1
+    if line_number >= first and line_number <= last {
+      if line_number > first {
+        output = "{output}\n"
+      }
+      output = match numbered {
+        true => "{output}{fmt::Sprintf("%6d  %s", line_number, line)}",
+        false => "{output}{line}",
+      }
+    }
+  }
+  output
+}
+
+fn render_lines(markdown: Str, start: Int, end: Int, numbered: Bool) Str!Error {
+  match start == 0 and end == 0 and (not numbered) {
+    true => Result::ok(markdown),
+    false => {
+      let lines = strings::Split(markdown, "\n")
+      let first = match start == 0 {
+        true => 1,
+        false => start,
+      }
+      let last = match end == 0 {
+        true => lines.size(),
+        false => end,
+      }
+      match first < 1 or last < first or first > lines.size() or last > lines.size() {
+        true => {
+          Result::err(
+            Error::new("line range {first}:{last} is outside document with {lines.size()} lines"),
+          )
+        },
+        false => Result::ok(render_selected_lines(lines, first, last, numbered)),
+      }
+    },
+  }
+}
+
 fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::RetrievedDocument!Error {
   match lookup.Ambiguous {
     true => Result::err(Error::new("document ID is ambiguous: {selector}")),
@@ -45,10 +89,10 @@ fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::Retr
 fn get(database: store::Store, selector: Str, options: GetOptions) Document!Error {
   let lookup = try database.db.LookupDocument(selector)
   let source = try require_document(lookup, selector)
-  let content = try sqlite::RenderLines(source.Markdown, options.start_line, options.end_line, options.numbered)
+  let content = try render_lines(source.Markdown, options.start_line, options.end_line, options.numbered)
   Result::ok(
     Document{
-      id: source.ID,
+      id: source.ContentHash.slice(0, 16).or(source.ContentHash),
       content_hash: source.ContentHash,
       virtual_path: source.VirtualPath,
       collection: source.Collection,

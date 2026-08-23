@@ -7,19 +7,8 @@ import (
 	"strings"
 )
 
-const shortContentIDLength = 16
-
-// ShortContentID returns the stable display form of a content hash.
-func ShortContentID(hash string) string {
-	if len(hash) <= shortContentIDLength {
-		return hash
-	}
-	return hash[:shortContentIDLength]
-}
-
 // RetrievedDocument contains original content and its canonical stored metadata.
 type RetrievedDocument struct {
-	ID           string
 	ContentHash  string
 	Collection   string
 	RelativePath string
@@ -51,7 +40,6 @@ func scanRetrieved(scanner interface{ Scan(...any) error }) (RetrievedDocument, 
 	if err != nil {
 		return RetrievedDocument{}, err
 	}
-	document.ID = ShortContentID(document.ContentHash)
 	document.VirtualPath = document.Collection + "/" + document.RelativePath
 	return document, nil
 }
@@ -145,35 +133,4 @@ func (db *DB) LookupDocumentByContentID(prefix string) (RetrievalLookup, error) 
 		return RetrievalLookup{}, err
 	}
 	return RetrievalLookup{Found: true, Document: document}, nil
-}
-
-// RenderLines selects a one-based inclusive line range. Zero start/end use the
-// beginning/end of the document. With no range and no numbering, source bytes
-// are returned unchanged.
-func RenderLines(markdown string, start, end int, numbered bool) (string, error) {
-	if start == 0 && end == 0 && !numbered {
-		return markdown, nil
-	}
-	lines := strings.Split(markdown, "\n")
-	if start == 0 {
-		start = 1
-	}
-	if end == 0 {
-		end = len(lines)
-	}
-	if start < 1 || end < start || start > len(lines) || end > len(lines) {
-		return "", fmt.Errorf("line range %d:%d is outside document with %d lines", start, end, len(lines))
-	}
-	selected := lines[start-1 : end]
-	if !numbered {
-		return strings.Join(selected, "\n"), nil
-	}
-	var output strings.Builder
-	for index, line := range selected {
-		if index > 0 {
-			output.WriteByte('\n')
-		}
-		fmt.Fprintf(&output, "%6d  %s", start+index, line)
-	}
-	return output.String(), nil
 }
