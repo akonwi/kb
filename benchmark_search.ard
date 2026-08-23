@@ -1,0 +1,98 @@
+use go:fmt
+use kb/collections
+use go:kb/ffi/metrics
+use kb/index
+use kb/search
+use kb/store
+use go:os
+use go:strings
+use go:time
+
+let document_count = 5_000
+let warm_iterations = 500
+let cold_connection_iterations = 25
+
+fn require_results(results: [search::Match]) Void!Error {
+  let first = results.at(0)
+  let valid = results.size() == 10 and first.map(fn(item: search::Match) Str {
+    item.collection
+  }).or("") == "benchmark" and (not first.map(fn(item: search::Match) Str {
+    item.markdown
+  }).or("").is_empty() and not first.map(fn(item: search::Match) Str {
+    item.snippet
+  }).or("").is_empty() and first.map(fn(item: search::Match) Float64 {
+    item.score
+  }).or(-1.0) >= 0.0 and first.map(fn(item: search::Match) Float64 {
+    item.score
+  }).or(2.0) < 1.0)
+  match valid {
+    true => Result::ok(()),
+    false => Result::err(Error::new("search benchmark result validation failed")),
+  }
+}
+
+fn run_benchmark() Void!Error {
+  let root = try os::MkdirTemp("", "kb-search-benchmark-root-")
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-search-benchmark-db-")
+  defer os::RemoveAll(database_dir)
+  let filler = strings::Repeat("Representative technical knowledge-base content. ", 12)
+  for mut i = 0; i < document_count; i =+ 1 {
+    let topic = match i % 5 {
+      0 => "SQLite schema migrations and transaction safety",
+      1 => "Ard channels and bounded worker pools",
+      2 => "Markdown headings links and code blocks",
+      3 => "Full text search with BM25 ranking",
+      _ => "Document retrieval from local collections",
+    }
+    try os::WriteFile(
+      "{root}/document-{i}.md",
+      mut "# Technical note {i}\n\n{topic}\n\n{filler}".bytes(),
+      420,
+    )
+  }
+  
+  let database_path = "{database_dir}/index.sqlite"
+  let database = try store::open_store(database_path)
+  let _ = try database.migrate()
+  let collection = try collections::create(database, "benchmark", root, "**/*.md", [])
+  let _ = try index::update(database, collection, index::default_options())
+  
+  let warm_started = time::Now()
+  mut result_count = 0
+  for mut iteration = 0; iteration < warm_iterations; iteration =+ 1 {
+    let results = try search::search(database, "sqlite migrations", search::default_options())
+    try require_results(results)
+    result_count = results.size()
+  }
+  let warm_average = metrics::AverageNanoseconds(time::Since(warm_started), warm_iterations)
+  try database.close()
+  
+  let cold_started = time::Now()
+  for mut iteration = 0; iteration < cold_connection_iterations; iteration =+ 1 {
+    let opened = try store::open_store(database_path)
+    let _ = try opened.migrate()
+    let results = try search::search(opened, "sqlite migrations", search::default_options())
+    try require_results(results)
+    try opened.close()
+  }
+  let cold_average = metrics::AverageNanoseconds(
+    time::Since(cold_started),
+    cold_connection_iterations,
+  )
+  let info = try os::Stat(database_path)
+  
+  fmt::Println("documents={document_count}")
+  fmt::Println("warm_search_avg_ns={warm_average}")
+  fmt::Println("cold_connection_search_avg_ns={cold_average}")
+  fmt::Println("results={result_count}")
+  fmt::Printf("database_bytes=%d\n", info.Size())
+  Result::ok(())
+}
+
+fn main() {
+  try run_benchmark() -> err {
+    fmt::Println("Error: {err.error()}")
+    os::Exit(1)
+  }
+}

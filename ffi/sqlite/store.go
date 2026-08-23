@@ -7,6 +7,9 @@ import (
 	"fmt"
 )
 
+// MaxDocumentBytes bounds original content retained by the store.
+const MaxDocumentBytes = 32 * 1024 * 1024
+
 // Collection is a directory registered in the knowledge base.
 type Collection struct {
 	ID             int
@@ -126,6 +129,9 @@ func (db *DB) DeleteCollectionByName(name string) (bool, error) {
 // InsertDocument atomically stores content and its document metadata. FTS5 is
 // maintained by schema triggers in the same transaction.
 func (db *DB) InsertDocument(collectionID int, relativePath, title, hash, markdown, searchableText string, sizeBytes int, mtimeNS int) (DocumentRecord, error) {
+	if len(markdown) > MaxDocumentBytes {
+		return DocumentRecord{}, fmt.Errorf("document exceeds %d-byte store limit", MaxDocumentBytes)
+	}
 	tx, err := db.conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return DocumentRecord{}, err

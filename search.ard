@@ -1,0 +1,368 @@
+use ard/testing
+
+use go:encoding/json
+use go:fmt
+use kb/collections
+use go:kb/ffi/sqlite
+use kb/index
+use kb/store
+use go:math
+use go:os
+use go:regexp
+use go:strings
+use go:unicode/utf8
+
+let query_tokens: mut regexp::Regexp = regexp::MustCompile(`"[^"]*"|[^\s\p{{Z}}]+`)
+let terminal_controls: mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
+
+struct SearchOptions {
+  collections: [Str],
+  limit: Int,
+}
+
+fn default_options() SearchOptions {
+  SearchOptions{collections: [], limit: 10}
+}
+
+struct Match {
+  document_id: Int,
+  collection: Str,
+  path: Str,
+  title: Str,
+  content_hash: Str,
+  markdown: Str,
+  snippet: Str,
+  context: Str,
+  modified_at: Str,
+  score: Float64,
+}
+
+fn quote_term(value: Str, prefix: Bool) Str!Error {
+  let cleaned = value.trim()
+  match cleaned.is_empty() or strings::Contains(cleaned, "*") {
+    true => Result::err(Error::new("search term or prefix is invalid")),
+    false => {
+      let escaped = strings::ReplaceAll(cleaned, "\"", "\"\"")
+      let suffix = match prefix {
+        true => "*",
+        false => "",
+      }
+      Result::ok("\"{escaped}\"{suffix}")
+    },
+  }
+}
+
+struct QueryToken {
+  value: Str,
+  prefix: Bool,
+}
+
+fn require_query(input: Str) Str!Error {
+  let query = input.trim()
+  let size = utf8::RuneCountInString(query)
+  match query.is_empty() or size > 4096 {
+    true => Result::err(Error::new("search query must contain between 1 and 4096 characters")),
+    false => Result::ok(query),
+  }
+}
+
+fn parse_query_token(token: Str) QueryToken!Error {
+  let starts_quote = strings::HasPrefix(token, "\"")
+  let ends_quote = strings::HasSuffix(token, "\"")
+  let invalid = starts_quote != ends_quote or strings::Contains(strings::Trim(token, "\""), "\"") or utf8::RuneCountInString(token) > 512
+  match invalid {
+    true => Result::err(Error::new("unmatched quote in search query")),
+    false => {
+      let phrase = starts_quote and ends_quote
+      mut value = match phrase {
+        true => strings::TrimSuffix(strings::TrimPrefix(token, "\""), "\""),
+        false => token,
+      }
+      let prefix = (not phrase) and strings::HasSuffix(value, "*")
+      if prefix {
+        value = strings::TrimSuffix(value, "*")
+      }
+      Result::ok(QueryToken{value: value, prefix: prefix})
+    },
+  }
+}
+
+fn validate_term_count(count: Int) Void!Error {
+  match count > 0 and count <= 64 {
+    true => Result::ok(()),
+    false => Result::err(Error::new("search query must contain between 1 and 64 terms")),
+  }
+}
+
+fn build_fts_query(input: Str) Str!Error {
+  let query = try require_query(input)
+  let tokens = query_tokens.FindAllString(query, -1)
+  try validate_term_count(tokens.size())
+  mut output = ""
+  for token in tokens {
+    let parsed = try parse_query_token(token)
+    let quoted = try quote_term(parsed.value, parsed.prefix)
+    if not output.is_empty() {
+      output = "{output} "
+    }
+    output = "{output}{quoted}"
+  }
+  match output.is_empty() {
+    true => Result::err(Error::new("search query has no terms")),
+    false => Result::ok(output),
+  }
+}
+
+fn require_collection(lookup: sqlite::CollectionLookup, name: Str) Int!Error {
+  match lookup.Found {
+    true => Result::ok(lookup.Collection.ID),
+    false => Result::err(Error::new("collection not found: {name}")),
+  }
+}
+
+fn collection_ids(database: store::Store, names: [Str]) [Int]!Error {
+  let identifiers: mut [Int] = mut []
+  for name in names {
+    let lookup = try database.db.LookupCollection(name)
+    identifiers.push(try require_collection(lookup, name))
+  }
+  Result::ok(identifiers.@)
+}
+
+fn score(rank: Float64) Float64 {
+  let magnitude = math::Abs(rank)
+  magnitude / (1.0 + magnitude)
+}
+
+fn validate_limit(limit: Int) Void!Error {
+  match limit > 0 and limit <= 100 {
+    true => Result::ok(()),
+    false => Result::err(Error::new("search limit must be between 1 and 100")),
+  }
+}
+
+fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Error {
+  try validate_limit(options.limit)
+  let expression = try build_fts_query(query)
+  let identifiers = try collection_ids(database, options.collections)
+  let ids: mut [Int] = mut []
+  for identifier in identifiers {
+    ids.push(identifier)
+  }
+  let rows = try database.db.SearchIndex(expression, ids, options.limit)
+  let matches: mut [Match] = mut []
+  for row in rows {
+    matches.push(
+      Match{
+        document_id: row.DocumentID,
+        collection: row.Collection,
+        path: row.RelativePath,
+        title: row.Title,
+        content_hash: row.ContentHash,
+        markdown: row.Markdown,
+        snippet: row.Snippet,
+        context: row.Context,
+        modified_at: row.ModifiedAt,
+        score: score(row.Rank),
+      },
+    )
+  }
+  Result::ok(matches.@)
+}
+
+fn safe_terminal(value: Str) Str {
+  terminal_controls.ReplaceAllString(value, "�")
+}
+
+fn format_human(matches: [Match]) Str {
+  mut output = ""
+  for item, index in matches {
+    if index > 0 {
+      output = "{output}\n"
+    }
+    let collection = safe_terminal(item.collection)
+    let path = safe_terminal(item.path)
+    let title = safe_terminal(item.title)
+    let snippet = safe_terminal(item.snippet)
+    output = "{output}{collection}/{path}  {fmt::Sprintf("%.3f", item.score)}\n{title}\n{snippet}"
+    if not item.context.is_empty() {
+      output = "{output}\nContext: {safe_terminal(item.context)}"
+    }
+  }
+  output
+}
+
+fn format_json(matches: [Match]) Str!Error {
+  let encoded = try json::Marshal(matches)
+  Result::ok(fmt::Sprintf("%s", encoded))
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn constructs_safe_fts_queries() Void!Str {
+  let terms = try build_fts_query("sqlite migrations").map_err(error_message)
+  try testing::assert(terms == "\"sqlite\" \"migrations\"", "expected quoted terms, got {terms}")
+  try testing::assert(
+    (try build_fts_query("\"schema migration\" migrat*").map_err(error_message)) == "\"schema migration\" \"migrat\"*",
+    "expected phrase and prefix",
+  )
+  try testing::assert(build_fts_query("\"unfinished phrase").is_err(), "expected unmatched quote error")
+  try testing::assert(build_fts_query("*").is_err(), "expected empty prefix error")
+  try testing::assert(build_fts_query("migrat**").is_err(), "expected repeated prefix error")
+  try testing::assert(
+    (try build_fts_query("sqlite\u00a0migrations").map_err(error_message)) == "\"sqlite\" \"migrations\"",
+    "expected Unicode whitespace tokenization",
+  )
+  try testing::assert(build_fts_query(strings::Repeat("a", 4097)).is_err(), "expected total query bound")
+  try testing::assert(build_fts_query(strings::Repeat("a", 513)).is_err(), "expected per-term bound")
+  testing::pass()
+}
+
+test fn searches_ranked_filtered_documents_with_context() Void!Str {
+  let root_a = try os::MkdirTemp("", "kb-search-a-").map_err(error_message)
+  defer os::RemoveAll(root_a)
+  let root_b = try os::MkdirTemp("", "kb-search-b-").map_err(error_message)
+  defer os::RemoveAll(root_b)
+  let database_dir = try os::MkdirTemp("", "kb-search-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  try os::MkdirAll("{root_a}/guides", 493).map_err(error_message)
+  try os::WriteFile(
+    "{root_a}/guides/title.md",
+    mut "# Rareterm guide\n\nSchema migration workflow.".bytes(),
+    420,
+  ).map_err(error_message)
+  try os::WriteFile(
+    "{root_a}/body.md",
+    mut "# Other guide\n\nRareterm appears in the body.".bytes(),
+    420,
+  ).map_err(error_message)
+  try os::WriteFile(
+    "{root_b}/other.md",
+    mut "# Rareterm elsewhere\n\nDifferent collection.".bytes(),
+    420,
+  ).map_err(error_message)
+  
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection_a = try collections::create(database, "alpha", root_a, "**/*.md", []).map_err(error_message)
+  let collection_b = try collections::create(database, "beta", root_b, "**/*.md", []).map_err(error_message)
+  let _ = try index::update(database, collection_a, index::default_options()).map_err(error_message)
+  let _ = try index::update(database, collection_b, index::default_options()).map_err(error_message)
+  try database.db.UpsertCollectionContext(
+    collection_a.ID,
+    "Guides",
+    "Wrong case context",
+  ).map_err(error_message)
+  try database.db.UpsertCollectionContext(
+    collection_a.ID,
+    "guide_",
+    "Wildcard context",
+  ).map_err(error_message)
+  try database.db.UpsertCollectionContext(
+    collection_a.ID,
+    "guides",
+    "Migration guides",
+  ).map_err(error_message)
+  
+  let alpha = try search(
+    database,
+    "rareterm",
+    SearchOptions{collections: ["alpha"], limit: 10},
+  ).map_err(error_message)
+  try testing::assert(alpha.size() == 2, "expected collection-filtered matches")
+  try testing::assert(
+    alpha.at(
+      0,
+    ).map(fn(item: Match) Str {
+      item.path
+    }).or("") == "guides/title.md",
+    "title weight should rank title match first",
+  )
+  try testing::assert(
+    alpha.at(
+      0,
+    ).map(fn(item: Match) Str {
+      item.context
+    }).or("") == "Migration guides",
+    "expected nearest path context",
+  )
+  try testing::assert(
+    alpha.at(
+      0,
+    ).map(fn(item: Match) Str {
+      item.markdown
+    }).or("").contains("Schema migration"),
+    "expected original Markdown joined to match",
+  )
+  try testing::assert(
+    alpha.at(
+      0,
+    ).map(fn(item: Match) Str {
+      item.snippet
+    }).or("").contains("[Rareterm]"),
+    "expected highlighted snippet",
+  )
+  let phrase = try search(database, "\"schema migration\"", default_options()).map_err(error_message)
+  try testing::assert(phrase.size() == 1, "expected phrase search")
+  let prefix = try search(database, "migrat*", default_options()).map_err(error_message)
+  try testing::assert(prefix.size() == 1, "expected explicit prefix search")
+  try testing::assert(
+    search(database, "rareterm", SearchOptions{collections: ["missing"], limit: 10}).is_err(),
+    "unknown collection must fail",
+  )
+  let no_ids: mut [Int] = mut []
+  try testing::assert(
+    database.db.SearchIndex("\"rareterm\"", no_ids, 101).is_err(),
+    "Go boundary must enforce result limits",
+  )
+  testing::pass()
+}
+
+test fn formats_human_and_json_results() Void!Str {
+  let matches = [
+    Match{
+      document_id: 1,
+      collection: "notes",
+      path: "database.md",
+      title: "SQLite",
+      content_hash: "abc",
+      markdown: "# SQLite",
+      snippet: "[SQLite] search",
+      context: "Database notes",
+      modified_at: "2026-01-01T00:00:00Z",
+      score: 0.75,
+    },
+  ]
+  let human = format_human(matches)
+  try testing::assert(
+    human.contains("notes/database.md") and human.contains("Database notes"),
+    "expected human output",
+  )
+  let hostile = [
+    Match{
+      document_id: 2,
+      collection: "notes",
+      path: "safe.md",
+      title: "unsafe\x1b]52;clipboard",
+      content_hash: "def",
+      markdown: "",
+      snippet: "snippet",
+      context: "",
+      modified_at: "",
+      score: 0.5,
+    },
+  ]
+  try testing::assert(
+    not format_human(hostile).contains("\x1b"),
+    "human output must remove terminal controls",
+  )
+  let output = try format_json(matches).map_err(error_message)
+  try testing::assert(
+    output.contains("\"collection\":\"notes\"") and output.contains("\"score\":0.75"),
+    "expected JSON output",
+  )
+  testing::pass()
+}

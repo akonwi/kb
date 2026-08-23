@@ -141,6 +141,9 @@ func (db *DB) ApplyIndexBatch(collectionID, generation int, changes []IndexChang
 
 	stats := BatchStats{}
 	for _, change := range changes {
+		if change.HasContent && len(change.Markdown) > MaxDocumentBytes {
+			return BatchStats{}, fmt.Errorf("document %q exceeds %d-byte store limit", change.RelativePath, MaxDocumentBytes)
+		}
 		var existing DocumentMetadata
 		err := tx.QueryRow(`
 			SELECT d.id, d.relative_path, d.content_hash, d.title, d.size_bytes, d.mtime_ns, d.active,

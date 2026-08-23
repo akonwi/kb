@@ -52,3 +52,19 @@ Recorded on the same machine and toolchain as the FTS5 baseline:
 | 3 | 301 ms | 6,635 | 0.049 ms | 65 ms | 0 | 118 ms | 92,558 | 4,942,424 bytes |
 
 The no-change path opens no document bodies and the filesystem remained responsive during this small-corpus run. Reserved source bytes describe the pipeline's file-content budget, not total process memory; the ending heap measurement provides additional context but is not peak RSS.
+
+## End-to-end lexical search baseline
+
+`benchmark_search.ard` creates and indexes 5,000 Markdown documents, then measures a two-term search returning 10 joined results with snippets and original content. The warm measurement repeats on one open store. The cold-connection measurement opens the database, verifies migrations, searches, and closes it for each iteration; it does not flush the operating system's filesystem cache.
+
+```sh
+ard run benchmark_search.ard
+```
+
+| Run | Warm search average | Cold-connection average | Database size |
+|---:|---:|---:|---:|
+| 1 | 1.874 ms | 3.185 ms | 17,154,048 bytes |
+| 2 | 1.822 ms | 2.925 ms | 17,162,240 bytes |
+| 3 | 2.303 ms | 2.808 ms | 17,154,048 bytes |
+
+These timings include safe query construction, BM25 ranking, collection/document/content joins, snippet generation, score conversion, and construction of 10 Ard result values.
