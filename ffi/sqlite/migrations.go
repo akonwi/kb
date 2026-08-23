@@ -15,6 +15,10 @@ type Migration struct {
 	SQL     string
 }
 
+// beforeMigrationCommit is a package-private test seam used by subprocess
+// crash tests to stop at a deterministic transaction boundary.
+var beforeMigrationCommit func()
+
 func migrationChecksum(migration Migration) string {
 	sum := sha256.Sum256([]byte(migration.SQL))
 	return hex.EncodeToString(sum[:])
@@ -104,6 +108,9 @@ func (db *DB) ApplyMigration(migration Migration) (applied bool, err error) {
 		checksum,
 	); err != nil {
 		return false, fmt.Errorf("record migration %d %q: %w", migration.Version, migration.Name, err)
+	}
+	if beforeMigrationCommit != nil {
+		beforeMigrationCommit()
 	}
 	if _, err := db.conn.ExecContext(context.Background(), "COMMIT"); err != nil {
 		return false, fmt.Errorf("commit migration %d %q: %w", migration.Version, migration.Name, err)

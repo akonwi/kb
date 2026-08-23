@@ -24,6 +24,47 @@ func TestMigrationIdentityIncludesSQLChecksum(t *testing.T) {
 	}
 }
 
+func TestFailedMigrationCanBeCorrectedAndRetried(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	broken := Migration{
+		Version: 1,
+		Name:    "retry migration",
+		SQL:     "CREATE TABLE partial_table (id INTEGER); INVALID SQL;",
+	}
+	if _, err := db.ApplyMigration(broken); err == nil {
+		t.Fatal("expected first migration attempt to fail")
+	}
+	corrected := Migration{
+		Version: 1,
+		Name:    "retry migration",
+		SQL:     "CREATE TABLE recovered_table (id INTEGER PRIMARY KEY)",
+	}
+	applied, err := db.ApplyMigration(corrected)
+	if err != nil || !applied {
+		t.Fatalf("corrected migration was not retryable: applied=%v err=%v", applied, err)
+	}
+	version, err := db.CurrentVersion()
+	if err != nil || version != 1 {
+		t.Fatalf("expected recovered version 1, got version=%d err=%v", version, err)
+	}
+	partial, err := db.TableExists("partial_table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := db.TableExists("recovered_table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial || !recovered {
+		t.Fatalf("unexpected recovered schema: partial=%v recovered=%v", partial, recovered)
+	}
+}
+
 func TestFailedMigrationRollsBackSchemaAndHistory(t *testing.T) {
 	db, err := Open(":memory:")
 	if err != nil {
