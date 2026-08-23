@@ -1,6 +1,6 @@
 use go:fmt
+use kb/benchmark_metrics
 use kb/collections
-use go:kb/ffi/metrics
 use kb/index
 use kb/search
 use kb/store
@@ -65,7 +65,10 @@ fn run_benchmark() Void!Error {
     try require_results(results)
     result_count = results.size()
   }
-  let warm_average = metrics::AverageNanoseconds(time::Since(warm_started), warm_iterations)
+  let warm_average = benchmark_metrics::average_nanoseconds(
+    time::Since(warm_started),
+    warm_iterations,
+  )
   try database.close()
   
   let cold_started = time::Now()
@@ -76,7 +79,7 @@ fn run_benchmark() Void!Error {
     try require_results(results)
     try opened.close()
   }
-  let cold_average = metrics::AverageNanoseconds(
+  let cold_average = benchmark_metrics::average_nanoseconds(
     time::Since(cold_started),
     cold_connection_iterations,
   )

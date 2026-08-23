@@ -1,0 +1,22 @@
+use go:runtime
+use go:strconv
+use go:time
+
+fn nanoseconds(elapsed: time::Duration) Int {
+  strconv::Atoi(
+    strconv::FormatInt(elapsed.Nanoseconds(), 10),
+  ).expect("duration nanoseconds fit Int")
+}
+
+fn average_nanoseconds(elapsed: time::Duration, iterations: Int) Int {
+  match iterations <= 0 {
+    true => 0,
+    false => nanoseconds(elapsed) / iterations,
+  }
+}
+
+fn heap_alloc_bytes() Int {
+  let stats = runtime::MemStats{}
+  runtime::ReadMemStats(mut stats)
+  strconv::Atoi(strconv::FormatUint(stats.HeapAlloc, 10)).expect("heap allocation fits Int")
+}

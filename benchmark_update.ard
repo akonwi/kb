@@ -1,8 +1,8 @@
 use ard/async
 
 use go:fmt
+use kb/benchmark_metrics
 use kb/collections
-use go:kb/ffi/metrics
 use go:kb/ffi/sqlite
 use kb/index
 use kb/store
@@ -70,13 +70,13 @@ fn measure_update(
     select {
       let completed = done.receiver().recv() => { result = completed },
       time::After(time::Millisecond).recv() => {
-        let wake_delay_ns = metrics::Nanoseconds(time::Since(probe_due))
+        let wake_delay_ns = benchmark_metrics::nanoseconds(time::Since(probe_due))
         if wake_delay_ns > max_probe_wake_delay_ns {
           max_probe_wake_delay_ns = wake_delay_ns
         }
         let probe_started = time::Now()
         let _ = os::Stat(collection.RootPath)
-        let probe_ns = metrics::Nanoseconds(time::Since(probe_started))
+        let probe_ns = benchmark_metrics::nanoseconds(time::Since(probe_started))
         if probe_ns > max_probe_ns {
           max_probe_ns = probe_ns
         }
@@ -89,7 +89,7 @@ fn measure_update(
       Result::ok(
         Measurement{
           stats: completed.stats,
-          duration_ns: metrics::Nanoseconds(time::Since(started)),
+          duration_ns: benchmark_metrics::nanoseconds(time::Since(started)),
           max_probe_ns: max_probe_ns,
           max_probe_wake_delay_ns: max_probe_wake_delay_ns,
         },
@@ -146,7 +146,7 @@ fn run_benchmark() Void!Error {
   let initial = try measure_update(database, collection, options)
   let unchanged = try measure_update(database, collection, options)
   let verified = try measure_update(database, collection, verify_options)
-  let heap_bytes = metrics::HeapAllocBytes()
+  let heap_bytes = benchmark_metrics::heap_alloc_bytes()
   try database.close()
   let info = try os::Stat(database_path)
   
