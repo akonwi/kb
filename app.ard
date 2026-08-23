@@ -1,6 +1,9 @@
+use ard/testing
+
 use go:os
 use go:path/filepath
 use go:regexp
+use go:runtime
 
 let terminal_controls: mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
 
@@ -12,13 +15,110 @@ fn description() Str {
   "A fast local knowledge base"
 }
 
+fn require_absolute_data_home(path: Str) Str!Error {
+  match filepath::IsAbs(path) {
+    true => Result::ok(path),
+    false => Result::err(Error::new("XDG_DATA_HOME must be an absolute path")),
+  }
+}
+
+fn platform_data_directory(
+  goos: Str,
+  home: Str,
+  user_config: Str,
+  xdg_data_home: Str,
+  local_app_data: Str,
+) Str!Error {
+  match xdg_data_home.is_empty() {
+    false => Result::ok(filepath::Join(try require_absolute_data_home(xdg_data_home), "kb")),
+    true => {
+      match goos {
+        "darwin" => Result::ok(filepath::Join(user_config, "kb")),
+        "windows" => {
+          match local_app_data.is_empty() {
+            true => Result::ok(filepath::Join(user_config, "kb")),
+            false => Result::ok(filepath::Join(local_app_data, "kb")),
+          }
+        },
+        _ => Result::ok(filepath::Join(home, ".local", "share", "kb")),
+      }
+    },
+  }
+}
+
+fn data_directory() Str!Error {
+  let xdg_data_home = os::Getenv("XDG_DATA_HOME")
+  match xdg_data_home.is_empty() {
+    false => platform_data_directory(runtime::GOOS, "", "", xdg_data_home, ""),
+    true => {
+      match runtime::GOOS {
+        "darwin" => platform_data_directory("darwin", "", try os::UserConfigDir(), "", ""),
+        "windows" => {
+          let local_app_data = os::Getenv("LOCALAPPDATA")
+          match local_app_data.is_empty() {
+            true => platform_data_directory("windows", "", try os::UserConfigDir(), "", ""),
+            false => platform_data_directory("windows", "", "", "", local_app_data),
+          }
+        },
+        _ => platform_data_directory(runtime::GOOS, try os::UserHomeDir(), "", "", ""),
+      }
+    },
+  }
+}
+
+fn prefer_existing_legacy_database(desired: Str, legacy: Str) Str!Error {
+  match desired == legacy {
+    true => Result::ok(desired),
+    false => {
+      match os::Stat(desired) {
+        ok(_) => Result::ok(desired),
+        err(error) => {
+          match os::IsNotExist(error) {
+            false => Result::err(error),
+            true => {
+              match os::Stat(legacy) {
+                ok(info) => {
+                  match info.Mode().IsRegular() {
+                    true => Result::ok(legacy),
+                    false => Result::ok(desired),
+                  }
+                },
+                err(legacy_error) => {
+                  match os::IsNotExist(legacy_error) {
+                    true => Result::ok(desired),
+                    false => Result::err(legacy_error),
+                  }
+                },
+              }
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+fn legacy_home_directory() Str {
+  match os::UserHomeDir() {
+    ok(home) => home,
+    err(_) => "",
+  }
+}
+
 fn database_path() Str!Error {
   let configured = os::Getenv("KB_DATABASE")
   match configured.is_empty() {
     false => Result::ok(configured),
     true => {
-      let home = try os::UserHomeDir()
-      Result::ok(filepath::Join(home, ".local", "share", "kb", "index.sqlite"))
+      let desired = filepath::Join(try data_directory(), "index.sqlite")
+      let home = legacy_home_directory()
+      match home.is_empty() {
+        true => Result::ok(desired),
+        false => {
+          let legacy = filepath::Join(home, ".local", "share", "kb", "index.sqlite")
+          prefer_existing_legacy_database(desired, legacy)
+        },
+      }
     },
   }
 }
@@ -29,4 +129,68 @@ fn ensure_database_directory(path: Str) Void!Error {
 
 fn safe_terminal(value: Str) Str {
   terminal_controls.ReplaceAllString(value, "�")
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+test fn chooses_platform_native_data_directories() Void!Str {
+  try testing::assert(
+    (try platform_data_directory(
+      "darwin",
+      "/home/me",
+      "/Users/me/Library/Application Support",
+      "",
+      "",
+    ).map_err(error_message)) == filepath::Join("/Users/me/Library/Application Support", "kb"),
+    "expected macOS Application Support",
+  )
+  try testing::assert(
+    (try platform_data_directory("linux", "/home/me", "/home/me/.config", "", "").map_err(error_message)) == filepath::Join("/home/me", ".local", "share", "kb"),
+    "expected Linux XDG fallback",
+  )
+  try testing::assert(
+    (try platform_data_directory(
+      "windows",
+      "C:\\Users\\me",
+      "C:\\Users\\me\\AppData\\Roaming",
+      "",
+      "C:\\Users\\me\\AppData\\Local",
+    ).map_err(error_message)) == filepath::Join("C:\\Users\\me\\AppData\\Local", "kb"),
+    "expected Windows local application data",
+  )
+  testing::pass()
+}
+
+test fn preserves_an_existing_legacy_database() Void!Str {
+  let directory = try os::MkdirTemp("", "kb-legacy-path-").map_err(error_message)
+  defer os::RemoveAll(directory)
+  let desired = filepath::Join(directory, "native", "index.sqlite")
+  let legacy = filepath::Join(directory, "legacy", "index.sqlite")
+  try os::MkdirAll(filepath::Dir(legacy), 448).map_err(error_message)
+  try os::WriteFile(legacy, mut "legacy".bytes(), 384).map_err(error_message)
+  try testing::assert(
+    (try prefer_existing_legacy_database(desired, legacy).map_err(error_message)) == legacy,
+    "expected existing legacy database fallback",
+  )
+  try os::MkdirAll(filepath::Dir(desired), 448).map_err(error_message)
+  try os::WriteFile(desired, mut "native".bytes(), 384).map_err(error_message)
+  try testing::assert(
+    (try prefer_existing_legacy_database(desired, legacy).map_err(error_message)) == desired,
+    "native database must take precedence",
+  )
+  testing::pass()
+}
+
+test fn xdg_data_home_overrides_platform_defaults() Void!Str {
+  try testing::assert(
+    (try platform_data_directory("darwin", "/home/me", "/native", "/custom/data", "").map_err(error_message)) == filepath::Join("/custom/data", "kb"),
+    "expected XDG_DATA_HOME precedence",
+  )
+  try testing::assert(
+    platform_data_directory("linux", "/home/me", "/config", "relative/data", "").is_err(),
+    "relative XDG_DATA_HOME must be rejected",
+  )
+  testing::pass()
 }

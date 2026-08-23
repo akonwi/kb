@@ -29,7 +29,7 @@ ard build main.ard --out kb
 ./kb search sqlite
 ```
 
-The database defaults to `~/.local/share/kb/index.sqlite`; override it with `KB_DATABASE`. See the [CLI reference](docs/cli.md) for all commands and output contracts.
+The database uses the platform-native user data directory (`~/Library/Application Support/kb` on macOS, `$XDG_DATA_HOME/kb` or `~/.local/share/kb` on Linux, and `%LOCALAPPDATA%\\kb` on Windows). Override the complete database path with `KB_DATABASE`. See the [CLI reference](docs/cli.md) for all commands and output contracts.
 
 Generated files are written under `ard-out/` and are not committed.
 

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -25,6 +26,42 @@ func TestMemoryDatabaseDetectionParsesSQLiteURIs(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentOpenOfExistingWALDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent-open.sqlite")
+	initial, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errors := make(chan error, 16)
+	var group sync.WaitGroup
+	for index := 0; index < 16; index++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			db, err := Open(path)
+			if err != nil {
+				errors <- err
+				return
+			}
+			if err := db.Close(); err != nil {
+				errors <- err
+			}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		t.Errorf("concurrent open: %v", err)
 	}
 }
 

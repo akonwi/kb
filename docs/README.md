@@ -26,6 +26,7 @@ Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 - [CLI reference](cli.md)
 - [Resilience testing](resilience-testing.md)
 - [Filesystem edge behavior](filesystem-behavior.md)
+- [Migrating from QMD](qmd-migration.md)
 
 ## ADR index
 

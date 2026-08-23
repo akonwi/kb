@@ -1,6 +1,7 @@
 use ard/testing
 
 use go:kb/ffi/fs
+use go:kb/ffi/sqlite
 use kb/store
 use go:os
 use go:strings
@@ -13,8 +14,86 @@ fn import_config(database: store::Store, content: Str, replace: Bool) Int!Error 
   database.db.ImportConfigJSON(content, replace)
 }
 
+fn import_qmd_config(
+  database: store::Store,
+  content: Str,
+  base_directory: Str,
+  replace: Bool,
+  include_nondefault: Bool,
+) sqlite::QMDImportResult!Error {
+  database.db.ImportQMDConfigYAML(content, base_directory, replace, include_nondefault)
+}
+
 private fn error_message(error: Error) Str {
   error.error()
+}
+
+test fn imports_qmd_collections_contexts_and_ignores_unsupported_settings() Void!Str {
+  let directory = try os::MkdirTemp("", "kb-qmd-import-").map_err(error_message)
+  defer os::RemoveAll(directory)
+  let root = try os::MkdirTemp("", "kb-qmd-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database = try store::open_store("{directory}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let yaml = `
+    global_context: Global fallback
+    editor_uri: "vscode://file/{{path}}"
+    models:
+      embed: example/model
+    collections:
+      notes:
+        path: {root}
+        pattern: "**/*.md"
+        ignore:
+          - "archive/**"
+        context:
+          "/": Notes root
+          projects: Project notes
+        update: "git pull"
+      muted:
+        path: {root}
+        includeByDefault: false
+      " plain ":
+        path: {root}
+    `
+  let imported = try import_qmd_config(database, yaml, directory, false, false).map_err(error_message)
+  try testing::assert(
+    imported.Imported == 2 and imported.Collections.size() == 2,
+    "expected two QMD collections",
+  )
+  try testing::assert(imported.Warnings.size() == 4, "expected unsupported-setting warnings")
+  let exported = try export_config(database).map_err(error_message)
+  try testing::assert(
+    exported.contains("\"name\": \"notes\"") and exported.contains("\"name\": \"plain\"") and (not exported.contains("\"name\": \"muted\"") and exported.contains("archive/**") and exported.contains("node_modules") and exported.contains("Notes root") and exported.contains("Project notes") and exported.contains("Global fallback")),
+    "expected converted collection, ignore, and contexts",
+  )
+  let _ = try database.db.InsertCollection("muted", root, "**/*.md", mut []).map_err(error_message)
+  try testing::assert(
+    import_qmd_config(database, yaml, directory, false, false).is_err(),
+    "skipped QMD collections must not leave an existing searchable collection",
+  )
+  let invalid = strings::ReplaceAll(yaml, root, "{root}/missing")
+  try testing::assert(
+    import_qmd_config(database, invalid, directory, false, true).is_err(),
+    "missing QMD roots must fail before mutation",
+  )
+  let comma_union = strings::ReplaceAll(yaml, "**/*.md", "**/*.md,**/*.txt")
+  try testing::assert(
+    import_qmd_config(database, comma_union, directory, false, true).is_err(),
+    "unsupported QMD comma-union patterns must fail loudly",
+  )
+  let extglob = strings::ReplaceAll(yaml, "**/*.md", "**/*.@(md|txt)")
+  try testing::assert(
+    import_qmd_config(database, extglob, directory, false, true).is_err(),
+    "unsupported QMD extglob patterns must fail loudly",
+  )
+  let brace_range = strings::ReplaceAll(yaml, "**/*.md", "file{{1..3}}.md")
+  try testing::assert(
+    import_qmd_config(database, brace_range, directory, false, true).is_err(),
+    "unsupported QMD brace ranges must fail loudly",
+  )
+  testing::pass()
 }
 
 test fn exports_and_atomically_imports_collection_configuration() Void!Str {

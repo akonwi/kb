@@ -1,6 +1,14 @@
 # CLI reference
 
-`kb` stores its SQLite database at `~/.local/share/kb/index.sqlite`. Set `KB_DATABASE` to use another path.
+`kb` stores its SQLite database in the platform-native per-user data directory:
+
+| Platform | Default database |
+|---|---|
+| macOS | `~/Library/Application Support/kb/index.sqlite` |
+| Linux and other Unix | `$XDG_DATA_HOME/kb/index.sqlite`, or `~/.local/share/kb/index.sqlite` when unset |
+| Windows | `%LOCALAPPDATA%\\kb\\index.sqlite` |
+
+`XDG_DATA_HOME` must be absolute. Set `KB_DATABASE` to override the complete database path on any platform; it takes precedence over platform and XDG defaults. If an older `~/.local/share/kb/index.sqlite` exists and the new native location does not, `kb` continues using the legacy database rather than silently opening an empty one. The legacy fallback also applies when `XDG_DATA_HOME` is set, preventing an upgrade from stranding a database created by an older build.
 
 ## Collections and indexing
 
@@ -54,6 +62,18 @@ kb config import kb-config.json --replace
 ```
 
 Configuration JSON contains versioned collections, glob/ignore rules, and path contexts—not indexed documents. Import validates the complete file before applying it in one transaction. Normal import upserts included collections. Changing a root or glob/ignore rule invalidates that collection's old index so the next `update` rebuilds it. `--replace` also removes collections absent from the explicit `collections` array; this cascades their indexed documents.
+
+### QMD migration
+
+```sh
+kb config import-qmd
+kb config import-qmd ~/.config/qmd/index.yml
+kb config import-qmd --update
+kb config import-qmd ~/.config/qmd/index.yml --include-nondefault
+kb config import-qmd ~/.config/qmd/index.yml --replace --include-nondefault
+```
+
+This converts QMD collections, glob/ignore rules, and contexts. Project-local and standard global QMD config locations are auto-detected. Indexing is a separate `kb update` step unless `--update` is explicitly supplied. QMD's standard ignored directories are preserved. Model/editor settings, generated vector data, and update hooks are not imported; hooks are never executed. `includeByDefault=false` collections are skipped unless explicitly included. See [Migrating from QMD](qmd-migration.md) for mapping and validation details.
 
 ## Output and exit codes
 

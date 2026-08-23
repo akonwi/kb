@@ -59,46 +59,53 @@ func Open(path string) (*DB, error) {
 		handle.Close()
 		return nil, err
 	}
-	if err := conn.PingContext(context.Background()); err != nil {
-		conn.Close()
-		handle.Close()
-		return nil, err
-	}
 	if _, err := conn.ExecContext(context.Background(), "PRAGMA busy_timeout = 5000"); err != nil {
 		conn.Close()
 		handle.Close()
-		return nil, err
+		return nil, fmt.Errorf("configure busy timeout: %w", err)
+	}
+	if err := conn.PingContext(context.Background()); err != nil {
+		conn.Close()
+		handle.Close()
+		return nil, fmt.Errorf("ping SQLite: %w", err)
 	}
 	var journalMode string
-	if err := conn.QueryRowContext(context.Background(), "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+	if err := conn.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		conn.Close()
 		handle.Close()
-		return nil, err
+		return nil, fmt.Errorf("read journal mode: %w", err)
 	}
 	if !isMemoryDatabase(path) && !strings.EqualFold(journalMode, "wal") {
-		conn.Close()
-		handle.Close()
-		return nil, fmt.Errorf("SQLite WAL mode is required for %q; filesystem returned %q", path, journalMode)
+		if err := conn.QueryRowContext(context.Background(), "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+			conn.Close()
+			handle.Close()
+			return nil, err
+		}
+		if !strings.EqualFold(journalMode, "wal") {
+			conn.Close()
+			handle.Close()
+			return nil, fmt.Errorf("SQLite WAL mode is required for %q; filesystem returned %q", path, journalMode)
+		}
 	}
 	if _, err := conn.ExecContext(context.Background(), "PRAGMA synchronous = FULL"); err != nil {
 		conn.Close()
 		handle.Close()
-		return nil, err
+		return nil, fmt.Errorf("configure synchronous mode: %w", err)
 	}
 	if _, err := conn.ExecContext(context.Background(), "PRAGMA cache_size = -20000"); err != nil {
 		conn.Close()
 		handle.Close()
-		return nil, err
+		return nil, fmt.Errorf("configure page cache: %w", err)
 	}
 	if _, err := conn.ExecContext(context.Background(), "PRAGMA mmap_size = 268435456"); err != nil {
 		conn.Close()
 		handle.Close()
-		return nil, err
+		return nil, fmt.Errorf("configure mmap size: %w", err)
 	}
 	if _, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys = ON"); err != nil {
 		conn.Close()
 		handle.Close()
-		return nil, err
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
 
 	return &DB{handle: handle, conn: conn}, nil
