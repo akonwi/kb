@@ -32,6 +32,7 @@ Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 
 - [Benchmarks](benchmarks.md)
 - [Resilience testing](resilience-testing.md)
+- [Release process](releasing.md)
 
 ## ADR index
 

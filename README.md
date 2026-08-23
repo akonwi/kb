@@ -80,6 +80,7 @@ Line ranges are one-based and inclusive.
 
 | Command | Purpose |
 |---|---|
+| `kb version` | Print the build version |
 | `kb collection add NAME PATH` | Register a directory |
 | `kb collection list` | List collections |
 | `kb collection show NAME` | Show collection settings |
@@ -138,6 +139,7 @@ Set `KB_DATABASE` to override the complete path. `kb` reads source Markdown but 
 
 - [Benchmarks and tuning](docs/benchmarks.md)
 - [Resilience testing](docs/resilience-testing.md)
+- [Release process](docs/releasing.md)
 - [Architecture Decision Records](docs/adrs/)
 
 ## Development
@@ -152,3 +154,7 @@ ard build main.ard --out kb
 ```
 
 Generated files are written under `ard-out/` and are not committed.
+
+## License
+
+[MIT](LICENSE)

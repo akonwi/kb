@@ -1,5 +1,6 @@
 use ard/testing
 
+use go:kb/ffi/buildinfo
 use go:os
 use go:path/filepath
 use go:regexp
@@ -13,6 +14,10 @@ fn name() Str {
 
 fn description() Str {
   "A fast local knowledge base"
+}
+
+fn version() Str {
+  buildinfo::GetVersion()
 }
 
 fn require_absolute_data_home(path: Str) Str!Error {

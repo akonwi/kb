@@ -1,5 +1,13 @@
 # CLI reference
 
+```sh
+kb version
+kb --version
+kb help
+```
+
+Development builds report `kb dev`; release builds report their complete tag, such as `kb v0.1.0`. Help includes the same version. These informational commands do not open the database.
+
 `kb` stores its SQLite database in the platform-native per-user data directory:
 
 | Platform | Default database |

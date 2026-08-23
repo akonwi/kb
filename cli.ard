@@ -14,28 +14,29 @@ use go:path/filepath
 use go:strconv
 use go:strings
 
-let usage = `
-  kb — a fast local knowledge base
-  
-  Usage:
-    kb collection add NAME ROOT [--glob PATTERN] [--ignore PATTERN ...]
-    kb collection list [--json]
-    kb collection show NAME [--json]
-    kb collection remove NAME
-    kb update [COLLECTION] [--verify]
-    kb search QUERY... [--collection NAME ...] [--limit N] [--json]
-    kb get ID|COLLECTION/PATH [--lines START[:END]] [--number] [--json]
-    kb status [--json]
-    kb cleanup [--vacuum] [--json]
-    kb doctor [--json]
-    kb config export [FILE|-]
-    kb config import FILE [--replace]
-    kb config import-qmd [FILE] [--replace] [--update] [--include-nondefault]
-  
-  Environment:
-    KB_DATABASE   Override the complete SQLite database path.
-    XDG_DATA_HOME Override the platform data root; must be absolute.
+fn usage() Str {
   `
+    kb {app::version()} — a fast local knowledge base
+    Usage:
+      kb version
+      kb collection add NAME ROOT [--glob PATTERN] [--ignore PATTERN ...]
+      kb collection list [--json]
+      kb collection show NAME [--json]
+      kb collection remove NAME
+      kb update [COLLECTION] [--verify]
+      kb search QUERY... [--collection NAME ...] [--limit N] [--json]
+      kb get ID|COLLECTION/PATH [--lines START[:END]] [--number] [--json]
+      kb status [--json]
+      kb cleanup [--vacuum] [--json]
+      kb doctor [--json]
+      kb config export [FILE|-]
+      kb config import FILE [--replace]
+      kb config import-qmd [FILE] [--replace] [--update] [--include-nondefault]
+    Environment:
+      KB_DATABASE   Override the complete SQLite database path.
+      XDG_DATA_HOME Override the platform data root; must be absolute.
+    `
+}
 
 fn usage_error(message: Str) Error {
   Error::new("usage: {message}")
@@ -561,25 +562,33 @@ fn command_config(database: store::Store, args: [Str]) Void!Error {
   }
 }
 
+fn command_version(args: [Str]) Void!Error {
+  match args.size() == 2 {
+    true => {
+      fmt::Println("{app::name()} {app::version()}")
+      Result::ok(())
+    },
+    false => reject_usage("version accepts no arguments"),
+  }
+}
+
 fn run(args: [Str]) Void!Error {
   let command = args.at(1).or("help")
   match command {
     "help" => {
-      fmt::Println(usage)
+      fmt::Println(usage())
       Result::ok(())
     },
     "--help" => {
-      fmt::Println(usage)
+      fmt::Println(usage())
       Result::ok(())
     },
     "-h" => {
-      fmt::Println(usage)
+      fmt::Println(usage())
       Result::ok(())
     },
-    "--version" => {
-      fmt::Println("{app::name()} 0.1.0")
-      Result::ok(())
-    },
+    "version" => command_version(args),
+    "--version" => command_version(args),
     _ => {
       let path = try app::database_path()
       try app::ensure_database_directory(path)
