@@ -356,6 +356,25 @@ func registerProcessCleanup(t *testing.T, command *exec.Cmd) {
 	})
 }
 
+func walSize(path string) int64 {
+	info, err := os.Stat(path + "-wal")
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func waitForWALGrowth(path string, baseline int64) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if walSize(path) > baseline {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	panic("timed out waiting for uncommitted WAL frames")
+}
+
 func waitForFile(t *testing.T, path string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -389,23 +408,35 @@ func TestCrashHelperProcess(t *testing.T) {
 		panic(err)
 	}
 	defer db.Close()
-	if _, err := db.conn.ExecContext(context.Background(), "PRAGMA journal_mode = DELETE"); err != nil {
-		panic(err)
-	}
 	switch os.Getenv("KB_CRASH_MODE") {
 	case "write":
+		if _, err := db.conn.ExecContext(context.Background(), "PRAGMA cache_size = 1"); err != nil {
+			panic(err)
+		}
+		baseline := walSize(path)
 		if _, err := db.conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
 			panic(err)
 		}
-		if _, err := db.conn.ExecContext(context.Background(), "INSERT INTO crash_documents(id, body) VALUES (2, 'uncommitted')"); err != nil {
+		if _, err := db.conn.ExecContext(context.Background(), `
+			WITH RECURSIVE sequence(value) AS (
+			  SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 256
+			)
+			INSERT INTO crash_documents(body) SELECT randomblob(4096) FROM sequence
+		`); err != nil {
 			panic(err)
 		}
+		waitForWALGrowth(path, baseline)
 		if err := os.WriteFile(os.Getenv("KB_CRASH_READY"), []byte("ready"), 0o600); err != nil {
 			panic(err)
 		}
 		time.Sleep(time.Minute)
 	case "migration":
+		if _, err := db.conn.ExecContext(context.Background(), "PRAGMA cache_size = 1"); err != nil {
+			panic(err)
+		}
+		baseline := walSize(path)
 		beforeMigrationCommit = func() {
+			waitForWALGrowth(path, baseline)
 			if err := os.WriteFile(os.Getenv("KB_CRASH_READY"), []byte("ready"), 0o600); err != nil {
 				panic(err)
 			}
@@ -414,7 +445,13 @@ func TestCrashHelperProcess(t *testing.T) {
 		_, err = db.ApplyMigration(Migration{
 			Version: 1,
 			Name:    "crash in progress",
-			SQL:     "CREATE TABLE crash_table (id INTEGER PRIMARY KEY, payload BLOB)",
+			SQL: `
+				CREATE TABLE crash_table (id INTEGER PRIMARY KEY, payload BLOB);
+				WITH RECURSIVE sequence(value) AS (
+				  SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 256
+				)
+				INSERT INTO crash_table(payload) SELECT randomblob(4096) FROM sequence;
+			`,
 		})
 		if err != nil {
 			panic(err)

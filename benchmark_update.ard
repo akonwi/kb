@@ -7,10 +7,19 @@ use go:kb/ffi/sqlite
 use kb/index
 use kb/store
 use go:os
+use go:strconv
 use go:strings
 use go:time
 
-let document_count = 2_000
+fn configured_int(name: Str, fallback: Int) Int {
+  let value = os::Getenv(name)
+  match value.is_empty() {
+    true => fallback,
+    false => strconv::Atoi(value).expect("{name} must be an integer"),
+  }
+}
+
+let document_count = configured_int("KB_BENCH_DOCUMENTS", 2_000)
 
 struct UpdateDone {
   stats: index::UpdateStats,
@@ -21,6 +30,7 @@ struct Measurement {
   stats: index::UpdateStats,
   duration_ns: Int,
   max_probe_ns: Int,
+  max_probe_wake_delay_ns: Int,
 }
 
 fn empty_stats() index::UpdateStats {
@@ -54,10 +64,16 @@ fn measure_update(
   
   mut result: UpdateDone? = Maybe::new()
   mut max_probe_ns = 0
+  mut max_probe_wake_delay_ns = 0
   while result.is_none() {
+    let probe_due = time::Now().Add(time::Millisecond)
     select {
       let completed = done.receiver().recv() => { result = completed },
       time::After(time::Millisecond).recv() => {
+        let wake_delay_ns = metrics::Nanoseconds(time::Since(probe_due))
+        if wake_delay_ns > max_probe_wake_delay_ns {
+          max_probe_wake_delay_ns = wake_delay_ns
+        }
         let probe_started = time::Now()
         let _ = os::Stat(collection.RootPath)
         let probe_ns = metrics::Nanoseconds(time::Since(probe_started))
@@ -75,6 +91,7 @@ fn measure_update(
           stats: completed.stats,
           duration_ns: metrics::Nanoseconds(time::Since(started)),
           max_probe_ns: max_probe_ns,
+          max_probe_wake_delay_ns: max_probe_wake_delay_ns,
         },
       )
     },
@@ -89,14 +106,30 @@ fn ensure_benchmark_correct(unchanged: index::UpdateStats, verified: index::Upda
   }
 }
 
+fn configured_options(verify: Bool?) index::UpdateOptions {
+  let defaults = index::default_options(verify)
+  index::UpdateOptions{
+    verify: defaults.verify,
+    readers: configured_int("KB_BENCH_READERS", defaults.readers),
+    entry_buffer: defaults.entry_buffer,
+    job_buffer: defaults.job_buffer,
+    change_buffer: defaults.change_buffer,
+    batch_size: configured_int("KB_BENCH_BATCH_SIZE", defaults.batch_size),
+    batch_bytes: configured_int("KB_BENCH_BATCH_BYTES", defaults.batch_bytes),
+    in_flight_bytes: configured_int("KB_BENCH_IN_FLIGHT_BYTES", defaults.in_flight_bytes),
+    max_file_bytes: defaults.max_file_bytes,
+  }
+}
+
 fn run_benchmark() Void!Error {
   let root = try os::MkdirTemp("", "kb-update-benchmark-root-")
   defer os::RemoveAll(root)
   let database_dir = try os::MkdirTemp("", "kb-update-benchmark-db-")
   defer os::RemoveAll(database_dir)
+  let body_repeats = configured_int("KB_BENCH_BODY_REPEATS", 16)
   let body = strings::Repeat(
     "Representative Markdown content for local knowledge-base indexing. ",
-    16,
+    body_repeats,
   )
   for mut i = 0; i < document_count; i =+ 1 {
     try os::WriteFile("{root}/document-{i}.md", mut "# Document {i}\n\n{body}".bytes(), 420)
@@ -108,18 +141,26 @@ fn run_benchmark() Void!Error {
   let _ = try database.migrate()
   let collection = try collections::create(database, "benchmark", root, "**/*.md", [])
   
-  let initial = try measure_update(database, collection, index::default_options())
-  let unchanged = try measure_update(database, collection, index::default_options())
-  let verified = try measure_update(database, collection, index::default_options(true))
+  let options = configured_options()
+  let verify_options = configured_options(true)
+  let initial = try measure_update(database, collection, options)
+  let unchanged = try measure_update(database, collection, options)
+  let verified = try measure_update(database, collection, verify_options)
   let heap_bytes = metrics::HeapAllocBytes()
   try database.close()
   let info = try os::Stat(database_path)
   
   try ensure_benchmark_correct(unchanged.stats, verified.stats)
   fmt::Println("documents={document_count}")
+  fmt::Println("body_repeats={body_repeats}")
+  fmt::Println("readers={options.readers}")
+  fmt::Println("batch_size={options.batch_size}")
+  fmt::Println("batch_bytes={options.batch_bytes}")
+  fmt::Println("in_flight_bytes={options.in_flight_bytes}")
   fmt::Println("initial_update_ns={initial.duration_ns}")
   fmt::Println("initial_files_per_second={document_count * 1_000_000_000 / initial.duration_ns}")
   fmt::Println("initial_max_fs_probe_ns={initial.max_probe_ns}")
+  fmt::Println("initial_max_probe_wake_delay_ns={initial.max_probe_wake_delay_ns}")
   fmt::Println("initial_peak_reserved_source_bytes={initial.stats.peak_in_flight_bytes}")
   fmt::Println("ending_heap_alloc_bytes={heap_bytes}")
   fmt::Println("no_change_update_ns={unchanged.duration_ns}")

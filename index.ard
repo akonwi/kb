@@ -28,9 +28,9 @@ fn default_options(verify: Bool?) UpdateOptions {
     entry_buffer: 128,
     job_buffer: 8,
     change_buffer: 8,
-    batch_size: 64,
-    batch_bytes: 8 * 1024 * 1024,
-    in_flight_bytes: 64 * 1024 * 1024,
+    batch_size: 512,
+    batch_bytes: 4 * 1024 * 1024,
+    in_flight_bytes: 48 * 1024 * 1024,
     max_file_bytes: 32 * 1024 * 1024,
   }
 }

@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -34,6 +36,17 @@ type SearchResult struct {
 	Rank  float64
 }
 
+func isMemoryDatabase(path string) bool {
+	if path == ":memory:" {
+		return true
+	}
+	parsed, err := url.Parse(path)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "file") {
+		return false
+	}
+	return strings.EqualFold(parsed.Query().Get("mode"), "memory") || parsed.Opaque == ":memory:" || parsed.Path == ":memory:"
+}
+
 // Open opens SQLite and verifies the connection before returning it.
 func Open(path string) (*DB, error) {
 	handle, err := sql.Open("sqlite", path)
@@ -52,6 +65,32 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if _, err := conn.ExecContext(context.Background(), "PRAGMA busy_timeout = 5000"); err != nil {
+		conn.Close()
+		handle.Close()
+		return nil, err
+	}
+	var journalMode string
+	if err := conn.QueryRowContext(context.Background(), "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+		conn.Close()
+		handle.Close()
+		return nil, err
+	}
+	if !isMemoryDatabase(path) && !strings.EqualFold(journalMode, "wal") {
+		conn.Close()
+		handle.Close()
+		return nil, fmt.Errorf("SQLite WAL mode is required for %q; filesystem returned %q", path, journalMode)
+	}
+	if _, err := conn.ExecContext(context.Background(), "PRAGMA synchronous = FULL"); err != nil {
+		conn.Close()
+		handle.Close()
+		return nil, err
+	}
+	if _, err := conn.ExecContext(context.Background(), "PRAGMA cache_size = -20000"); err != nil {
+		conn.Close()
+		handle.Close()
+		return nil, err
+	}
+	if _, err := conn.ExecContext(context.Background(), "PRAGMA mmap_size = 268435456"); err != nil {
 		conn.Close()
 		handle.Close()
 		return nil, err

@@ -11,7 +11,7 @@ The SQLite adapter includes deterministic failure tests in `ffi/sqlite/resilienc
 - **Process death after commit:** killing the process after the commit marker preserves both schema and migration history.
 - **Migration failures:** malformed migrations roll back schema and history; checksum drift is rejected; a failed version can be corrected and retried safely.
 
-Crash tests execute the compiled Go test binary as a child process and kill it with the operating system rather than simulating an ordinary returned error. They force SQLite's rollback-journal mode for recovery coverage and use a package-private pre-commit test seam to stop migrations at a deterministic transaction boundary without creating a large workload. `go test -short` skips subprocess crash tests.
+Crash tests execute the compiled Go test binary as a child process and kill it with the operating system rather than simulating an ordinary returned error. They retain the production WAL journal mode, use a small test-only page cache plus a bounded multi-page transaction to verify uncommitted frames reach the WAL, and use a package-private pre-commit test seam to stop migrations at a deterministic transaction boundary. `go test -short` skips subprocess crash tests.
 
 ## Commands
 

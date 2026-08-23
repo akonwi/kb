@@ -68,3 +68,31 @@ ard run benchmark_search.ard
 | 3 | 2.303 ms | 2.808 ms | 17,154,048 bytes |
 
 These timings include safe query construction, BM25 ranking, collection/document/content joins, snippet generation, score conversion, and construction of 10 Ard result values.
+
+## Indexing and SQLite tuning
+
+Tuning used 10,000 generated Markdown files on the same local APFS development machine. Each configuration was measured repeatedly with warm tool/build caches. The benchmark now accepts `KB_BENCH_DOCUMENTS`, `KB_BENCH_BODY_REPEATS`, `KB_BENCH_READERS`, `KB_BENCH_BATCH_SIZE`, `KB_BENCH_BATCH_BYTES`, and `KB_BENCH_IN_FLIGHT_BYTES` so results can be reproduced without source edits.
+
+The selected indexing defaults are:
+
+| Setting | Previous | Selected | Reason |
+|---|---:|---:|---|
+| Reader workers | 4 | 4 | Best balance of initial/verify latency and filesystem probe responsiveness; 6–8 readers did not consistently improve throughput. |
+| Transaction documents | 64 | 512 | Captured most of the measured transaction-overhead improvement while bounding metadata-only write-lock intervals; the byte cap independently bounds large-file transactions. |
+| Transaction source bytes | 8 MiB | 4 MiB | Similar or better throughput on 1 MiB documents with a lower retained-byte peak; 16 MiB was slower and less responsive. |
+| In-flight source bytes | 64 MiB | 48 MiB | Within roughly 1–2% of larger budgets on 1 MiB files while lowering the hard memory budget by 25%; larger budgets did not improve 4 MiB-file throughput. |
+
+Representative median results from three interleaved baseline/selected runs in separate worktrees:
+
+| Configuration | Initial 10k update | No-change update | Verify update |
+|---|---:|---:|---:|
+| Previous defaults and SQLite settings | 1.632 s | 0.333 s | 0.520 s |
+| Selected defaults and SQLite settings | 1.270 s | 0.273 s | 0.491 s |
+
+The selected profile reduced median initial-index time by about 22%, no-change time by about 18%, and verify time by about 6% in the interleaved comparison. The benchmark reports both filesystem-operation time and timer wake delay so scheduler stalls are not hidden by starting the probe clock late.
+
+The selected SQLite connection settings are WAL journal mode, `synchronous=FULL`, a 5-second busy timeout, a 20 MiB page cache, default file-backed temporary storage, and a maximum 256 MiB memory-map window. WAL preserves concurrent readers during writes. `FULL` was retained because it measured close to `NORMAL` while providing stronger durability for collection configuration, which is not merely derived index data. The page-cache and mmap settings materially improved the repeated 10,000-file workload without eagerly allocating the mmap maximum. The 48 MiB budget bounds retained source bodies only, not total process RSS; SQLite's page cache is separately bounded, mmap pages are demand-loaded, and temporary work remains file-backed.
+
+WAL is required for on-disk databases and is verified during open rather than silently accepting a fallback mode. Collections should therefore live in a database on a local filesystem with working shared-memory/WAL semantics; unsupported network filesystems fail explicitly.
+
+These values are conservative local defaults, not universal maxima. Network filesystems, cold caches, spinning disks, and very large Markdown documents require separate release-platform measurements.
