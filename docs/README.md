@@ -18,15 +18,20 @@ Accepted ADRs are historical records. If a decision changes, add a new ADR and l
 
 Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 
-## Technical notes
+## User guides
 
-- [Benchmarks](benchmarks.md)
+- [Getting started](getting-started.md)
+- [CLI reference](cli.md)
+- [Migrating from QMD](qmd-migration.md)
+- [Data, backup, and recovery](data-management.md)
 - [Markdown indexing](markdown-indexing.md)
 - [Lexical search](search.md)
-- [CLI reference](cli.md)
-- [Resilience testing](resilience-testing.md)
 - [Filesystem edge behavior](filesystem-behavior.md)
-- [Migrating from QMD](qmd-migration.md)
+
+## Engineering notes
+
+- [Benchmarks](benchmarks.md)
+- [Resilience testing](resilience-testing.md)
 
 ## ADR index
 

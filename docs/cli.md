@@ -8,7 +8,7 @@
 | Linux and other Unix | `$XDG_DATA_HOME/kb/index.sqlite`, or `~/.local/share/kb/index.sqlite` when unset |
 | Windows | `%LOCALAPPDATA%\\kb\\index.sqlite` |
 
-`XDG_DATA_HOME` must be absolute. Set `KB_DATABASE` to override the complete database path on any platform; it takes precedence over platform and XDG defaults. If an older `~/.local/share/kb/index.sqlite` exists and the new native location does not, `kb` continues using the legacy database rather than silently opening an empty one. The legacy fallback also applies when `XDG_DATA_HOME` is set, preventing an upgrade from stranding a database created by an older build.
+`XDG_DATA_HOME` must be absolute. Set `KB_DATABASE` to override the complete database path on any platform; it takes precedence over platform and XDG defaults. If an older `~/.local/share/kb/index.sqlite` exists and the new native location does not, `kb` continues using the legacy database rather than silently opening an empty one. The legacy fallback also applies when `XDG_DATA_HOME` is set, preventing an upgrade from stranding a database created by an older build. See [Data, backup, and recovery](data-management.md) before copying or restoring the WAL-mode database.
 
 ## Collections and indexing
 
@@ -27,7 +27,7 @@ Collection names are case-insensitively unique and cannot contain path separator
 
 ```sh
 kb search sqlite migrations
-kb search '"schema migration"' migrat* --collection notes --limit 20
+kb search '"schema migration"' 'migrat*' --collection notes --limit 20
 kb search sqlite --json
 
 kb get notes/guides/sqlite.md
