@@ -3,7 +3,9 @@ package fs
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -25,8 +27,13 @@ func TestWalkStreamsMatchingFiles(t *testing.T) {
 	write("nested/skip.md", "skip")
 	write("nested/text.txt", "text")
 	write(".hidden/secret.md", "secret")
-	if err := os.Symlink(filepath.Join(root, "nested"), filepath.Join(root, "linked")); err != nil {
-		t.Fatal(err)
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink(filepath.Join(root, "nested"), filepath.Join(root, "linked")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(root, "root.md"), filepath.Join(root, "alias.md")); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	scanner, err := OpenScanner(root)
@@ -111,6 +118,9 @@ func TestReadAndHashRejectsChangedMetadata(t *testing.T) {
 }
 
 func TestReadAndHashRejectsReplacementEscapingRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink replacement requires Windows symlink privileges")
+	}
 	root := t.TempDir()
 	outside := t.TempDir()
 	insidePath := filepath.Join(root, "doc.md")
@@ -143,6 +153,9 @@ func TestReadAndHashRejectsReplacementEscapingRoot(t *testing.T) {
 }
 
 func TestScannerPinsRootAcrossRename(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("root replacement requires Windows symlink privileges")
+	}
 	parent := t.TempDir()
 	root := filepath.Join(parent, "root")
 	outside := filepath.Join(parent, "outside")
@@ -182,6 +195,94 @@ func TestScannerPinsRootAcrossRename(t *testing.T) {
 	}
 	if result.Markdown != "inside" {
 		t.Fatalf("scanner followed replaced root: %q", result.Markdown)
+	}
+}
+
+func TestUnicodePathsAndNanosecondMtimesRoundTrip(t *testing.T) {
+	if strconv.IntSize != 64 {
+		t.Skip("nanosecond mtimes require a supported 64-bit target")
+	}
+	root := t.TempDir()
+	relative := filepath.Join("日本語", "naïve 🧠.md")
+	path := filepath.Join(root, relative)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("unicode body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	requested := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.Chtimes(path, requested, requested); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().UnixNano() != requested.UnixNano() {
+		t.Skipf("filesystem rounded nanosecond mtime to %s", info.ModTime())
+	}
+
+	scanner, err := OpenScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+	entry, err := scanner.Inspect(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.RelativePath != filepath.ToSlash(relative) {
+		t.Fatalf("Unicode path changed: got %q", entry.RelativePath)
+	}
+	if entry.MtimeNS != int(info.ModTime().UnixNano()) {
+		t.Fatalf("nanosecond mtime changed: got %d want %d", entry.MtimeNS, info.ModTime().UnixNano())
+	}
+	result, err := scanner.ReadAndHash(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RelativePath != filepath.ToSlash(relative) || result.Markdown != "unicode body" {
+		t.Fatalf("unexpected Unicode read result: %#v", result)
+	}
+
+	changed := info.ModTime().Add(time.Millisecond)
+	if err := os.Chtimes(path, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	changedInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedInfo.ModTime().UnixNano() == info.ModTime().UnixNano() {
+		t.Skip("filesystem did not retain a subsecond mtime change")
+	}
+	if _, err := scanner.ReadAndHash(entry); err == nil {
+		t.Fatal("subsecond timestamp change was not detected")
+	}
+}
+
+func TestReadAndHashReportsInaccessibleFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "private.md")
+	if err := os.WriteFile(path, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scanner, err := OpenScanner(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+	entry, err := scanner.Inspect("private.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Skipf("filesystem cannot remove read permissions: %v", err)
+	}
+	defer os.Chmod(path, 0o600)
+	if _, err := scanner.ReadAndHash(entry); err == nil {
+		t.Skip("current user or filesystem bypasses file permission bits")
 	}
 }
 

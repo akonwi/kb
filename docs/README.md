@@ -25,6 +25,7 @@ Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 - [Lexical search](search.md)
 - [CLI reference](cli.md)
 - [Resilience testing](resilience-testing.md)
+- [Filesystem edge behavior](filesystem-behavior.md)
 
 ## ADR index
 

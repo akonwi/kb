@@ -6,6 +6,8 @@ use go:kb/ffi/fs
 use go:kb/ffi/sqlite
 use kb/store
 use go:os
+use go:runtime
+use go:strings
 
 struct UpdateOptions {
   verify: Bool,
@@ -590,6 +592,56 @@ test fn bounded_pipeline_handles_more_files_than_channel_capacity() Void!Str {
   try testing::assert(
     indexed.peak_in_flight_bytes <= limits.in_flight_bytes,
     "in-flight bytes must remain bounded",
+  )
+  testing::pass()
+}
+
+test fn indexes_large_and_unicode_paths_without_following_symlinks() Void!Str {
+  let root = try os::MkdirTemp("", "kb-index-edge-root-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let database_dir = try os::MkdirTemp("", "kb-index-edge-db-").map_err(error_message)
+  defer os::RemoveAll(database_dir)
+  try os::MkdirAll("{root}/日本語", 493).map_err(error_message)
+  let unicode_path = "日本語/naïve 🧠.md"
+  try os::WriteFile(
+    "{root}/{unicode_path}",
+    mut "# Unicode path\n\nsearchable_unicode_marker".bytes(),
+    420,
+  ).map_err(error_message)
+  if runtime::GOOS != "windows" {
+    try os::Symlink("{root}/{unicode_path}", "{root}/alias.md").map_err(error_message)
+  }
+  let large_source = "# Large boundary\n\n{strings::Repeat("large_boundary_marker ", 50_000)}"
+  try os::WriteFile("{root}/large.md", mut large_source.bytes(), 420).map_err(error_message)
+  let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
+  defer database.close()
+  let _ = try database.migrate().map_err(error_message)
+  let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
+  let limits = constrained_options(large_source.bytes().size())
+  let indexed = try update(database, collection, limits).map_err(error_message)
+  try testing::assert(
+    indexed.walked == 2 and indexed.inserted == 2,
+    "expected Unicode and boundary-sized files while ignoring the symlink",
+  )
+  let unicode = try database.db.LookupDocumentByPath("notes", unicode_path).map_err(error_message)
+  try testing::assert(unicode.Found, "expected exact Unicode virtual-path retrieval")
+  try testing::assert(
+    (try database.db.LookupDocumentByPath("notes", "alias.md").map_err(error_message)).Found == false,
+    "symlink must not enter the index",
+  )
+  try testing::assert(
+    (try database.db.Search("large_boundary_marker", 10).map_err(error_message)).size() == 1,
+    "expected boundary-sized content in FTS",
+  )
+  try os::WriteFile(
+    "{root}/large.md",
+    mut strings::Repeat("z", large_source.bytes().size() + 1).bytes(),
+    420,
+  ).map_err(error_message)
+  try testing::assert(update(database, collection, limits).is_err(), "expected over-limit file rejection")
+  try testing::assert(
+    (try database.db.Search("large_boundary_marker", 10).map_err(error_message)).size() == 1,
+    "failed oversized replacement must preserve committed content",
   )
   testing::pass()
 }
