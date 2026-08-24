@@ -4,7 +4,10 @@ use go:fmt
 use go:kb/ffi/sqlite
 use kb/store
 use go:os
+use go:regexp
 use go:strings
+
+let content_id_pattern: mut regexp::Regexp = regexp::MustCompile(`^[0-9a-f]+$`)
 
 struct GetOptions {
   start_line: Int,
@@ -74,6 +77,34 @@ fn render_lines(markdown: Str, start: Int, end: Int, numbered: Bool) Str!Error {
   }
 }
 
+fn normalize_content_id(value: Str) Str!Error {
+  let normalized = strings::ToLower(value)
+  match normalized.size() >= 8 and normalized.size() <= 64 {
+    false => Result::err(Error::new("content ID must contain 8 to 64 hexadecimal characters")),
+    true => {
+      match content_id_pattern.MatchString(normalized) {
+        true => Result::ok(normalized),
+        false => Result::err(Error::new("content ID must contain only hexadecimal characters")),
+      }
+    },
+  }
+}
+
+fn lookup_document(database: store::Store, selector: Str) sqlite::RetrievalLookup!Error {
+  let parts = strings::SplitN(selector, "/", 2)
+  match parts.size() == 1 {
+    true => database.db.LookupDocumentByContentID(try normalize_content_id(selector)),
+    false => {
+      let collection = parts.at(0).expect("split collection")
+      let relative_path = parts.at(1).expect("split relative path")
+      match collection.is_empty() or relative_path.is_empty() {
+        true => Result::err(Error::new("virtual path must be collection/relative-path")),
+        false => database.db.LookupDocumentByPath(collection, relative_path),
+      }
+    },
+  }
+}
+
 fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::RetrievedDocument!Error {
   match lookup.Ambiguous {
     true => Result::err(Error::new("document ID is ambiguous: {selector}")),
@@ -86,10 +117,11 @@ fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::Retr
   }
 }
 
-fn get(database: store::Store, selector: Str, options: GetOptions) Document!Error {
-  let lookup = try database.db.LookupDocument(selector)
+fn get(database: store::Store, selector: Str, options: GetOptions?) Document!Error {
+  let configured = options.or(default_options())
+  let lookup = try lookup_document(database, selector)
   let source = try require_document(lookup, selector)
-  let content = try render_lines(source.Markdown, options.start_line, options.end_line, options.numbered)
+  let content = try render_lines(source.Markdown, configured.start_line, configured.end_line, configured.numbered)
   Result::ok(
     Document{
       id: source.ContentHash.slice(0, 16).or(source.ContentHash),
@@ -139,7 +171,7 @@ test fn retrieves_by_virtual_path_and_stable_content_id() Void!Str {
     1,
   ).map_err(error_message)
   
-  let path_document = try get(database, "alpha/guide.md", default_options()).map_err(error_message)
+  let path_document = try get(database, "alpha/guide.md").map_err(error_message)
   try testing::assert(path_document.id == "abcdef1234567890", "expected short content ID")
   try testing::assert(path_document.content == "one\ntwo\nthree", "expected unchanged source")
   let id_document = try get(
@@ -152,10 +184,11 @@ test fn retrieves_by_virtual_path_and_stable_content_id() Void!Str {
     },
   ).map_err(error_message)
   try testing::assert(id_document.content == "     2  two\n     3  three", "expected numbered line range")
-  try testing::assert(
-    get(database, "alpha/missing.md", default_options()).is_err(),
-    "expected missing path",
-  )
+  let uppercase_id = try get(database, "ABCDEF123456").map_err(error_message)
+  try testing::assert(uppercase_id.path == "guide.md", "expected case-insensitive content ID")
+  try testing::assert(get(database, "alpha/missing.md").is_err(), "expected missing path")
+  try testing::assert(get(database, "/guide.md").is_err(), "expected collection")
+  try testing::assert(get(database, "alpha/").is_err(), "expected relative path")
   testing::pass()
 }
 
@@ -186,8 +219,9 @@ test fn rejects_ambiguous_or_invalid_content_ids_and_ranges() Void!Str {
     3,
     1,
   ).map_err(error_message)
-  try testing::assert(get(database, "12345678", default_options()).is_err(), "expected ambiguous ID")
-  try testing::assert(get(database, "not-an-id", default_options()).is_err(), "expected invalid ID")
+  try testing::assert(get(database, "12345678").is_err(), "expected ambiguous ID")
+  try testing::assert(get(database, "not-an-id").is_err(), "expected invalid ID")
+  try testing::assert(get(database, "1234").is_err(), "expected short ID rejection")
   try testing::assert(
     get(
       database,

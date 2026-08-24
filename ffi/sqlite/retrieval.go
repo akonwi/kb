@@ -3,8 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"strings"
 )
 
 // RetrievedDocument contains original content and its canonical stored metadata.
@@ -44,18 +42,6 @@ func scanRetrieved(scanner interface{ Scan(...any) error }) (RetrievedDocument, 
 	return document, nil
 }
 
-// LookupDocument resolves either collection/path or a content ID.
-func (db *DB) LookupDocument(selector string) (RetrievalLookup, error) {
-	separator := strings.IndexByte(selector, '/')
-	if separator < 0 {
-		return db.LookupDocumentByContentID(selector)
-	}
-	if separator == 0 || separator == len(selector)-1 {
-		return RetrievalLookup{}, fmt.Errorf("virtual path must be collection/relative-path")
-	}
-	return db.LookupDocumentByPath(selector[:separator], selector[separator+1:])
-}
-
 // LookupDocumentByPath retrieves one active document by collection and relative path.
 func (db *DB) LookupDocumentByPath(collection, relativePath string) (RetrievalLookup, error) {
 	document, err := scanRetrieved(db.conn.QueryRowContext(context.Background(), `
@@ -77,19 +63,10 @@ func (db *DB) LookupDocumentByPath(collection, relativePath string) (RetrievalLo
 	return RetrievalLookup{Found: true, Document: document}, nil
 }
 
-// LookupDocumentByContentID retrieves content by a hexadecimal hash prefix.
-// Duplicate paths with the same complete hash are aliases, while a prefix that
-// identifies multiple complete hashes is ambiguous.
+// LookupDocumentByContentID retrieves content by a validated, lowercase hash
+// prefix. Duplicate paths with the same complete hash are aliases, while a
+// prefix that identifies multiple complete hashes is ambiguous.
 func (db *DB) LookupDocumentByContentID(prefix string) (RetrievalLookup, error) {
-	if len(prefix) < 8 || len(prefix) > 64 {
-		return RetrievalLookup{}, fmt.Errorf("content ID must contain 8 to 64 hexadecimal characters")
-	}
-	prefix = strings.ToLower(prefix)
-	for _, character := range prefix {
-		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
-			return RetrievalLookup{}, fmt.Errorf("content ID must contain only hexadecimal characters")
-		}
-	}
 	rows, err := db.conn.QueryContext(context.Background(), `
 		SELECT DISTINCT content_hash
 		FROM documents
