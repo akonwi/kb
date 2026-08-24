@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -32,11 +31,17 @@ type qmdCollection struct {
 	IncludeByDefault *bool             `yaml:"includeByDefault"`
 }
 
-// QMDImportResult describes a QMD configuration migration.
+// QMDImportResult describes an applied QMD configuration migration.
 type QMDImportResult struct {
 	Imported    int
 	Collections []string
 	Warnings    []string
+}
+
+// QMDConversion contains a decoded QMD configuration ready for Ard validation.
+type QMDConversion struct {
+	Config   ConfigFile
+	Warnings []string
 }
 
 var qmdBraceRangePattern = regexp.MustCompile(`\{[^{}]*\.\.[^{}]*\}`)
@@ -125,27 +130,27 @@ func qmdIgnorePatterns(configured []string) ([]string, error) {
 	return patterns, nil
 }
 
-// ImportQMDConfigYAML converts QMD's YAML collection configuration into kb's
-// versioned configuration and applies it through the same atomic importer.
-// Relative collection paths are resolved against baseDir.
-func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefault bool) (QMDImportResult, error) {
+// ConvertQMDConfigYAML decodes QMD's YAML collection configuration into kb's
+// versioned representation. Relative paths are resolved against baseDir; Ard
+// validates and atomically applies the conversion.
+func (db *DB) ConvertQMDConfigYAML(data, baseDir string, replace, includeNonDefault bool) (QMDConversion, error) {
 	decoder := yaml.NewDecoder(bytes.NewBufferString(data))
 	var source qmdConfig
 	if err := decoder.Decode(&source); err != nil {
-		return QMDImportResult{}, fmt.Errorf("decode QMD config: %w", err)
+		return QMDConversion{}, fmt.Errorf("decode QMD config: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		if err == nil {
-			return QMDImportResult{}, fmt.Errorf("decode QMD config: trailing YAML document")
+			return QMDConversion{}, fmt.Errorf("decode QMD config: trailing YAML document")
 		}
-		return QMDImportResult{}, fmt.Errorf("decode QMD config: %w", err)
+		return QMDConversion{}, fmt.Errorf("decode QMD config: %w", err)
 	}
 	if source.Collections == nil {
-		return QMDImportResult{}, fmt.Errorf("QMD config collections must be an explicit mapping")
+		return QMDConversion{}, fmt.Errorf("QMD config collections must be an explicit mapping")
 	}
 	absoluteBase, err := filepath.Abs(baseDir)
 	if err != nil {
-		return QMDImportResult{}, fmt.Errorf("resolve QMD config directory: %w", err)
+		return QMDConversion{}, fmt.Errorf("resolve QMD config directory: %w", err)
 	}
 
 	names := make([]string, 0, len(source.Collections))
@@ -154,9 +159,11 @@ func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefau
 	}
 	sort.Strings(names)
 
-	converted := configFile{Version: configVersion, Collections: make([]configCollection, 0, len(names))}
+	converted := ConfigFile{
+		Version: configVersion, Collections: make([]ConfigCollection, 0, len(names)),
+		CollectionsPresent: true,
+	}
 	warnings := make([]string, 0)
-	importedNames := make([]string, 0, len(names))
 	mutedCollections := 0
 	if len(source.Models) > 0 {
 		warnings = append(warnings, "QMD model settings were not imported; kb lexical search does not require models")
@@ -167,17 +174,14 @@ func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefau
 
 	for _, name := range names {
 		item := source.Collections[name]
-		canonicalName, err := validateCollectionName(name)
-		if err != nil {
-			return QMDImportResult{}, fmt.Errorf("QMD collection %q: %w", name, err)
-		}
+		canonicalName := strings.TrimSpace(name)
 		if item.IncludeByDefault != nil && !*item.IncludeByDefault && !includeNonDefault {
 			existing, err := db.LookupCollection(canonicalName)
 			if err != nil {
-				return QMDImportResult{}, err
+				return QMDConversion{}, err
 			}
 			if existing.Found {
-				return QMDImportResult{}, fmt.Errorf("collection %q already exists in kb but QMD marks it includeByDefault=false; remove it or pass --include-nondefault", canonicalName)
+				return QMDConversion{}, fmt.Errorf("collection %q already exists in kb but QMD marks it includeByDefault=false; remove it or pass --include-nondefault", canonicalName)
 			}
 			warnings = append(warnings, fmt.Sprintf("collection %q was skipped because includeByDefault=false; pass --include-nondefault to import it", canonicalName))
 			mutedCollections++
@@ -185,7 +189,7 @@ func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefau
 		}
 		root := item.Path
 		if root == "" {
-			return QMDImportResult{}, fmt.Errorf("QMD collection %q has no path", name)
+			return QMDConversion{}, fmt.Errorf("QMD collection %q has no path", name)
 		}
 		if !filepath.IsAbs(root) {
 			root = filepath.Join(absoluteBase, root)
@@ -195,11 +199,11 @@ func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefau
 			pattern = "**/*.md"
 		}
 		if syntax := unsupportedQMDGlobSyntax(pattern); syntax != "" {
-			return QMDImportResult{}, fmt.Errorf("QMD collection %q uses unsupported %s in pattern %q; split it into compatible collections", canonicalName, syntax, pattern)
+			return QMDConversion{}, fmt.Errorf("QMD collection %q uses unsupported %s in pattern %q; split it into compatible collections", canonicalName, syntax, pattern)
 		}
 		ignorePatterns, err := qmdIgnorePatterns(item.Ignore)
 		if err != nil {
-			return QMDImportResult{}, fmt.Errorf("QMD collection %q: %w", canonicalName, err)
+			return QMDConversion{}, fmt.Errorf("QMD collection %q: %w", canonicalName, err)
 		}
 
 		contexts := make(map[string]string, len(item.Context)+1)
@@ -214,18 +218,17 @@ func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefau
 			contextPrefixes = append(contextPrefixes, prefix)
 		}
 		sort.Strings(contextPrefixes)
-		convertedContexts := make([]configContext, 0, len(contextPrefixes))
+		convertedContexts := make([]ConfigContext, 0, len(contextPrefixes))
 		for _, prefix := range contextPrefixes {
-			convertedContexts = append(convertedContexts, configContext{
+			convertedContexts = append(convertedContexts, ConfigContext{
 				PathPrefix: prefix, Description: contexts[prefix],
 			})
 		}
 
-		converted.Collections = append(converted.Collections, configCollection{
-			Name: canonicalName, RootPath: root, GlobPattern: pattern,
+		converted.Collections = append(converted.Collections, ConfigCollection{
+			Name: name, RootPath: root, GlobPattern: pattern,
 			IgnorePatterns: ignorePatterns, Contexts: convertedContexts,
 		})
-		importedNames = append(importedNames, canonicalName)
 		if item.Update != "" {
 			warnings = append(warnings, fmt.Sprintf("collection %q: QMD update hook was not imported or executed", canonicalName))
 		}
@@ -234,16 +237,8 @@ func (db *DB) ImportQMDConfigYAML(data, baseDir string, replace, includeNonDefau
 		}
 	}
 	if replace && mutedCollections > 0 {
-		return QMDImportResult{}, fmt.Errorf("--replace would omit %d includeByDefault=false collection(s); also pass --include-nondefault", mutedCollections)
+		return QMDConversion{}, fmt.Errorf("--replace would omit %d includeByDefault=false collection(s); also pass --include-nondefault", mutedCollections)
 	}
 
-	encoded, err := json.Marshal(converted)
-	if err != nil {
-		return QMDImportResult{}, err
-	}
-	imported, err := db.ImportConfigJSON(string(encoded), replace)
-	if err != nil {
-		return QMDImportResult{}, err
-	}
-	return QMDImportResult{Imported: imported, Collections: importedNames, Warnings: warnings}, nil
+	return QMDConversion{Config: converted, Warnings: warnings}, nil
 }

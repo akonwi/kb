@@ -1,5 +1,6 @@
 use ard/testing
 
+use kb/collections
 use go:kb/ffi/fs
 use go:kb/ffi/sqlite
 use kb/store
@@ -10,8 +11,94 @@ fn export_config(database: store::Store) Str!Error {
   database.db.ExportConfigJSON()
 }
 
+fn contains(values: [Str], candidate: Str) Bool {
+  mut found = false
+  for value in values {
+    if value == candidate {
+      found = true
+    }
+  }
+  found
+}
+
+fn validation_error(message: Str) Error {
+  Error::new(message)
+}
+
+fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
+  try testing::assert(
+    source.Version == 1,
+    "unsupported config version {source.Version}",
+  ).map_err(validation_error)
+  try testing::assert(
+    source.CollectionsPresent,
+    "config collections must be an explicit JSON array",
+  ).map_err(validation_error)
+  let names: mut [Str] = mut []
+  let validated: mut [sqlite::ConfigCollection] = mut []
+  for item in source.Collections {
+    let name = try collections::normalize_name(item.Name)
+    let name_key = strings::ToLower(name)
+    try testing::assert(
+      not contains(names.@, name_key),
+      "duplicate collection name {name}",
+    ).map_err(validation_error)
+    names.push(name_key)
+    try testing::assert(
+      not item.RootPath.is_empty(),
+      "collection {name} root_path is required",
+    ).map_err(validation_error)
+    let root = try fs::CanonicalDirectory(item.RootPath)
+    try testing::assert(
+      not item.GlobPattern.is_empty(),
+      "collection {name} has an empty glob",
+    ).map_err(validation_error)
+    let ignores: mut [Str] = mut []
+    for pattern in item.IgnorePatterns {
+      try testing::assert(
+        not pattern.is_empty(),
+        "collection {name} has an empty ignore pattern",
+      ).map_err(validation_error)
+      ignores.push(pattern)
+    }
+    try fs::ValidatePatterns(item.GlobPattern, ignores)
+    let prefixes: mut [Str] = mut []
+    let contexts: mut [sqlite::ConfigContext] = mut []
+    for context in item.Contexts {
+      let prefix = strings::Trim(strings::TrimSpace(context.PathPrefix), "/")
+      try testing::assert(
+        not prefix == "." or prefix == ".." or strings::HasPrefix(prefix, "../") or strings::Contains(prefix, "/../"),
+        "collection {name} has invalid context prefix {prefix}",
+      ).map_err(validation_error)
+      try testing::assert(
+        not contains(prefixes.@, prefix),
+        "collection {name} has duplicate context prefix {prefix}",
+      ).map_err(validation_error)
+      prefixes.push(prefix)
+      contexts.push(sqlite::ConfigContext{PathPrefix: prefix, Description: context.Description})
+    }
+    validated.push(
+      sqlite::ConfigCollection{
+        Name: name,
+        RootPath: root,
+        GlobPattern: item.GlobPattern,
+        IgnorePatterns: ignores.@,
+        Contexts: contexts.@,
+      },
+    )
+  }
+  Result::ok(
+    sqlite::ConfigFile{
+      Version: source.Version,
+      Collections: validated.@,
+      CollectionsPresent: true,
+    },
+  )
+}
+
 fn import_config(database: store::Store, content: Str, replace: Bool) Int!Error {
-  database.db.ImportConfigJSON(content, replace)
+  let decoded = try sqlite::DecodeConfigJSON(content)
+  database.db.ImportConfig(try validate_config(decoded), replace)
 }
 
 fn import_qmd_config(
@@ -21,7 +108,20 @@ fn import_qmd_config(
   replace: Bool,
   include_nondefault: Bool,
 ) sqlite::QMDImportResult!Error {
-  database.db.ImportQMDConfigYAML(content, base_directory, replace, include_nondefault)
+  let conversion = try database.db.ConvertQMDConfigYAML(content, base_directory, replace, include_nondefault)
+  let validated = try validate_config(conversion.Config)
+  let names: mut [Str] = mut []
+  for collection in validated.Collections {
+    names.push(collection.Name)
+  }
+  let imported = try database.db.ImportConfig(validated, replace)
+  Result::ok(
+    sqlite::QMDImportResult{
+      Imported: imported,
+      Collections: names.@,
+      Warnings: conversion.Warnings,
+    },
+  )
 }
 
 private fn error_message(error: Error) Str {

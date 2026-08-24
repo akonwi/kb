@@ -4,6 +4,15 @@ use go:kb/ffi/fs
 use go:kb/ffi/sqlite
 use kb/store
 use go:os
+use go:strings
+
+fn normalize_name(value: Str) Str!Error {
+  let name = strings::TrimSpace(value)
+  match name.is_empty() or name.contains("/") or name.contains("\\") {
+    true => Result::err(Error::new("collection name must be nonempty and contain no path separators")),
+    false => Result::ok(name),
+  }
+}
 
 fn create(
   database: store::Store,
@@ -12,13 +21,14 @@ fn create(
   glob_pattern: Str,
   ignore_patterns: [Str],
 ) sqlite::Collection!Error {
+  let normalized_name = try normalize_name(name)
   let root = try fs::CanonicalDirectory(root_path)
   let ignores: mut [Str] = mut []
   for pattern in ignore_patterns {
     ignores.push(pattern)
   }
   try fs::ValidatePatterns(glob_pattern, ignores)
-  database.db.InsertCollection(name, root, glob_pattern, ignores)
+  database.db.InsertCollection(normalized_name, root, glob_pattern, ignores)
 }
 
 fn list(database: store::Store) [sqlite::Collection]!Error {

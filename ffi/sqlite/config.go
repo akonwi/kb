@@ -7,29 +7,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
-
-	"github.com/bmatcuk/doublestar/v4"
 )
 
 const configVersion = 1
 
-type configFile struct {
-	Version     int                `json:"version"`
-	Collections []configCollection `json:"collections"`
+type ConfigFile struct {
+	Version            int                `json:"version"`
+	Collections        []ConfigCollection `json:"collections"`
+	CollectionsPresent bool               `json:"-"`
 }
 
-type configCollection struct {
+type ConfigCollection struct {
 	Name           string          `json:"name"`
 	RootPath       string          `json:"root_path"`
 	GlobPattern    string          `json:"glob_pattern"`
 	IgnorePatterns []string        `json:"ignore_patterns"`
-	Contexts       []configContext `json:"contexts"`
+	Contexts       []ConfigContext `json:"contexts"`
 }
 
-type configContext struct {
+type ConfigContext struct {
 	PathPrefix  string `json:"path_prefix"`
 	Description string `json:"description"`
 }
@@ -41,12 +38,12 @@ func (db *DB) ExportConfigJSON() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	output := configFile{Version: configVersion, Collections: make([]configCollection, 0, len(collections))}
+	output := ConfigFile{Version: configVersion, Collections: make([]ConfigCollection, 0, len(collections))}
 	for _, collection := range collections {
-		entry := configCollection{
+		entry := ConfigCollection{
 			Name: collection.Name, RootPath: collection.RootPath,
 			GlobPattern: collection.GlobPattern, IgnorePatterns: collection.IgnorePatterns,
-			Contexts: make([]configContext, 0),
+			Contexts: make([]ConfigContext, 0),
 		}
 		rows, err := db.conn.QueryContext(context.Background(), `
 			SELECT path_prefix, description
@@ -58,7 +55,7 @@ func (db *DB) ExportConfigJSON() (string, error) {
 			return "", err
 		}
 		for rows.Next() {
-			var item configContext
+			var item ConfigContext
 			if err := rows.Scan(&item.PathPrefix, &item.Description); err != nil {
 				rows.Close()
 				return "", err
@@ -77,97 +74,29 @@ func (db *DB) ExportConfigJSON() (string, error) {
 	return string(encoded) + "\n", nil
 }
 
-func canonicalConfigRoot(path string) (string, error) {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("%q is not a directory", path)
-	}
-	return resolved, nil
-}
-
-func validateConfig(config *configFile) error {
-	if config.Version != configVersion {
-		return fmt.Errorf("unsupported config version %d", config.Version)
-	}
-	if config.Collections == nil {
-		return fmt.Errorf("config collections must be an explicit JSON array")
-	}
-	seenNames := make(map[string]struct{}, len(config.Collections))
-	for index := range config.Collections {
-		collection := &config.Collections[index]
-		validatedName, err := validateCollectionName(collection.Name)
-		if err != nil {
-			return fmt.Errorf("collection %q: %w", collection.Name, err)
-		}
-		collection.Name = validatedName
-		key := strings.ToLower(collection.Name)
-		if _, exists := seenNames[key]; exists {
-			return fmt.Errorf("duplicate collection name %q", collection.Name)
-		}
-		seenNames[key] = struct{}{}
-		if collection.RootPath == "" {
-			return fmt.Errorf("collection %q root_path is required", collection.Name)
-		}
-		root, err := canonicalConfigRoot(collection.RootPath)
-		if err != nil {
-			return fmt.Errorf("collection %q root: %w", collection.Name, err)
-		}
-		collection.RootPath = root
-		if collection.GlobPattern == "" || !doublestar.ValidatePattern(collection.GlobPattern) {
-			return fmt.Errorf("collection %q has invalid glob %q", collection.Name, collection.GlobPattern)
-		}
-		for _, pattern := range collection.IgnorePatterns {
-			if pattern == "" || !doublestar.ValidatePattern(pattern) {
-				return fmt.Errorf("collection %q has invalid ignore pattern %q", collection.Name, pattern)
-			}
-		}
-		seenContexts := make(map[string]struct{}, len(collection.Contexts))
-		for contextIndex := range collection.Contexts {
-			item := &collection.Contexts[contextIndex]
-			item.PathPrefix = strings.Trim(strings.TrimSpace(item.PathPrefix), "/")
-			if item.PathPrefix == "." || item.PathPrefix == ".." || strings.HasPrefix(item.PathPrefix, "../") || strings.Contains(item.PathPrefix, "/../") {
-				return fmt.Errorf("collection %q has invalid context prefix %q", collection.Name, item.PathPrefix)
-			}
-			if _, exists := seenContexts[item.PathPrefix]; exists {
-				return fmt.Errorf("collection %q has duplicate context prefix %q", collection.Name, item.PathPrefix)
-			}
-			seenContexts[item.PathPrefix] = struct{}{}
-		}
-	}
-	return nil
-}
-
-// ImportConfigJSON validates the complete document before atomically upserting
-// collections and replacing contexts for each included collection. replace
-// removes collections absent from the imported snapshot.
-func (db *DB) ImportConfigJSON(data string, replace bool) (int, error) {
+// DecodeConfigJSON strictly decodes one configuration document. Validation and
+// normalization are owned by the Ard configuration layer.
+func DecodeConfigJSON(data string) (ConfigFile, error) {
 	decoder := json.NewDecoder(bytes.NewBufferString(data))
 	decoder.DisallowUnknownFields()
-	var config configFile
+	var config ConfigFile
 	if err := decoder.Decode(&config); err != nil {
-		return 0, fmt.Errorf("decode config: %w", err)
+		return ConfigFile{}, fmt.Errorf("decode config: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		if err == nil {
-			return 0, fmt.Errorf("decode config: trailing JSON value")
+			return ConfigFile{}, fmt.Errorf("decode config: trailing JSON value")
 		}
-		return 0, fmt.Errorf("decode config: %w", err)
+		return ConfigFile{}, fmt.Errorf("decode config: %w", err)
 	}
-	if err := validateConfig(&config); err != nil {
-		return 0, err
-	}
+	config.CollectionsPresent = config.Collections != nil
+	return config, nil
+}
 
+// ImportConfig atomically upserts validated collections and replaces contexts
+// for each included collection. replace removes collections absent from the
+// imported snapshot.
+func (db *DB) ImportConfig(config ConfigFile, replace bool) (int, error) {
 	tx, err := db.conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return 0, err
