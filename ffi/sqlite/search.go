@@ -7,8 +7,6 @@ import (
 )
 
 // IndexSearchRow is one ranked production-index match with retrieval metadata.
-const maxSearchMarkdownBytes = 64 * 1024 * 1024
-
 type IndexSearchRow struct {
 	DocumentID   int
 	CollectionID int
@@ -26,12 +24,6 @@ type IndexSearchRow struct {
 // SearchIndex searches active documents. The query is an already-safe FTS5
 // expression constructed by the Ard search layer.
 func (db *DB) SearchIndex(query string, collectionIDs []int, limit int) ([]IndexSearchRow, error) {
-	if limit <= 0 {
-		return []IndexSearchRow{}, nil
-	}
-	if limit > 100 {
-		return nil, fmt.Errorf("search limit %d exceeds maximum 100", limit)
-	}
 	var filter strings.Builder
 	args := make([]any, 0, len(collectionIDs)+2)
 	args = append(args, query)
@@ -98,7 +90,6 @@ func (db *DB) SearchIndex(query string, collectionIDs []int, limit int) ([]Index
 	defer rows.Close()
 
 	results := make([]IndexSearchRow, 0, limit)
-	totalMarkdownBytes := 0
 	for rows.Next() {
 		var result IndexSearchRow
 		if err := rows.Scan(
@@ -115,10 +106,6 @@ func (db *DB) SearchIndex(query string, collectionIDs []int, limit int) ([]Index
 			&result.Rank,
 		); err != nil {
 			return nil, err
-		}
-		totalMarkdownBytes += len(result.Markdown)
-		if totalMarkdownBytes > maxSearchMarkdownBytes {
-			return nil, fmt.Errorf("search results exceed %d bytes of original content", maxSearchMarkdownBytes)
 		}
 		results = append(results, result)
 	}

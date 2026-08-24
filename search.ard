@@ -14,6 +14,7 @@ use go:unicode/utf8
 
 let query_tokens: mut regexp::Regexp = regexp::MustCompile(`"[^"]*"|[^\s\p{{Z}}]+`)
 let terminal_controls: mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
+let max_search_markdown_bytes = 64 * 1_024 * 1_024
 
 struct SearchOptions {
   collections: [Str],
@@ -142,6 +143,17 @@ fn validate_limit(limit: Int) Void!Error {
   }
 }
 
+fn validate_markdown_bytes(total: Int) Void!Error {
+  match total <= max_search_markdown_bytes {
+    true => Result::ok(()),
+    false => {
+      Result::err(
+        Error::new("search results exceed {max_search_markdown_bytes} bytes of original content"),
+      )
+    },
+  }
+}
+
 fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Error {
   try validate_limit(options.limit)
   let expression = try build_fts_query(query)
@@ -152,7 +164,10 @@ fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Er
   }
   let rows = try database.db.SearchIndex(expression, ids, options.limit)
   let matches: mut [Match] = mut []
+  mut total_markdown_bytes = 0
   for row in rows {
+    total_markdown_bytes =+ row.Markdown.bytes().size()
+    try validate_markdown_bytes(total_markdown_bytes)
     matches.push(
       Match{
         id: row.ContentHash.slice(0, 16).or(row.ContentHash),
@@ -315,10 +330,13 @@ test fn searches_ranked_filtered_documents_with_context() Void!Str {
     search(database, "rareterm", SearchOptions{collections: ["missing"], limit: 10}).is_err(),
     "unknown collection must fail",
   )
-  let no_ids: mut [Int] = mut []
   try testing::assert(
-    database.db.SearchIndex("\"rareterm\"", no_ids, 101).is_err(),
-    "Go boundary must enforce result limits",
+    search(database, "rareterm", SearchOptions{collections: [], limit: 101}).is_err(),
+    "search must reject result limits above 100",
+  )
+  try testing::assert(
+    validate_markdown_bytes(max_search_markdown_bytes).is_ok() and validate_markdown_bytes(max_search_markdown_bytes + 1).is_err(),
+    "Markdown byte budget must accept the limit and reject overflow",
   )
   testing::pass()
 }
