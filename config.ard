@@ -5,7 +5,13 @@ use go:kb/ffi/fs
 use go:kb/ffi/sqlite
 use kb/store
 use go:os
+use go:path/filepath
+use go:regexp
 use go:strings
+
+let qmd_brace_range_pattern: mut regexp::Regexp = regexp::MustCompile(
+  "\\{{[^{{}}]*\\.\\.[^{{}}]*\\}}",
+)
 
 fn export_config(database: store::Store) Str!Error {
   database.db.ExportConfigJSON()
@@ -101,6 +107,80 @@ fn import_config(database: store::Store, content: Str, replace: Bool) Int!Error 
   database.db.ImportConfig(try validate_config(decoded), replace)
 }
 
+fn has_top_level_comma(pattern: Str) Bool {
+  mut brace_depth = 0
+  mut bracket_depth = 0
+  mut escaped = false
+  mut found = false
+  for character in pattern.runes() {
+    match {
+      escaped => { escaped = false },
+      character == '\\' => { escaped = true },
+      character == '{' => { brace_depth =+ 1 },
+      character == '}' and brace_depth > 0 => { brace_depth =- 1 },
+      character == '[' => { bracket_depth =+ 1 },
+      character == ']' and bracket_depth > 0 => { bracket_depth =- 1 },
+      character == ',' and brace_depth == 0 and bracket_depth == 0 => { found = true },
+      _ => (),
+    }
+  }
+  found
+}
+
+fn unsupported_qmd_glob_syntax(pattern: Str) Str? {
+  let syntax = mut Maybe::new<Str>()
+  if has_top_level_comma(pattern) {
+    syntax.set("comma unions")
+  }
+  if syntax.is_none() and strings::HasPrefix(pattern, "!") {
+    syntax.set("leading negation")
+  }
+  if syntax.is_none() and qmd_brace_range_pattern.MatchString(pattern) {
+    syntax.set("brace ranges")
+  }
+  for marker in ["@(", "!(", "+(", "?(", "*(", "[[:"] {
+    if syntax.is_none() and strings::Contains(pattern, marker) {
+      syntax.set("extglob/POSIX classes")
+    }
+  }
+  syntax.@
+}
+
+fn validate_qmd_pattern(collection: Str, kind: Str, pattern: Str) Void!Error {
+  match unsupported_qmd_glob_syntax(pattern) {
+    syntax => {
+      Result::err(
+        Error::new("QMD collection {collection} uses unsupported {syntax} in {kind} {pattern}"),
+      )
+    },
+    _ => Result::ok(()),
+  }
+}
+
+fn qmd_ignore_patterns(collection: Str, configured: [Str]) [Str]!Error {
+  let defaults = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/.cache/**",
+    "**/vendor/**",
+    "**/dist/**",
+    "**/build/**",
+  ]
+  let patterns: mut [Str] = mut []
+  for pattern in defaults {
+    if not contains(patterns.@, pattern) {
+      patterns.push(pattern)
+    }
+  }
+  for pattern in configured {
+    try validate_qmd_pattern(collection, "ignore pattern", pattern)
+    if not contains(patterns.@, pattern) {
+      patterns.push(pattern)
+    }
+  }
+  Result::ok(patterns.@)
+}
+
 fn import_qmd_config(
   database: store::Store,
   content: Str,
@@ -108,8 +188,91 @@ fn import_qmd_config(
   replace: Bool,
   include_nondefault: Bool,
 ) sqlite::QMDImportResult!Error {
-  let conversion = try database.db.ConvertQMDConfigYAML(content, base_directory, replace, include_nondefault)
-  let validated = try validate_config(conversion.Config)
+  let source = try sqlite::DecodeQMDConfigYAML(content)
+  let absolute_base = try filepath::Abs(base_directory)
+  let warnings: mut [Str] = mut []
+  if source.ModelsPresent {
+    warnings.push("QMD model settings were not imported; kb lexical search does not require models")
+  }
+  if not source.EditorURI.is_empty() or not source.EditorURITemplate.is_empty() or not source.EditorURICamel.is_empty() or not source.EditorURIKebab.is_empty() {
+    warnings.push("QMD editor URI settings were not imported")
+  }
+  mut muted_collections = 0
+  let converted: mut [sqlite::ConfigCollection] = mut []
+  for item in source.Collections {
+    let name = try collections::normalize_name(item.Name)
+    let included_by_default = match item.IncludeByDefaultSet {
+      true => item.IncludeByDefault,
+      false => true,
+    }
+    if not included_by_default and not include_nondefault {
+      let existing = try database.db.LookupCollection(name)
+      try testing::assert(
+        not existing.Found,
+        "collection {name} already exists in kb but QMD marks it includeByDefault=false; remove it or pass --include-nondefault",
+      ).map_err(validation_error)
+      warnings.push(
+        "collection {name} was skipped because includeByDefault=false; pass --include-nondefault to import it",
+      )
+      muted_collections =+ 1
+    } else {
+      try testing::assert(
+        not item.Path.is_empty(),
+        "QMD collection {name} has no path",
+      ).map_err(validation_error)
+      let root = match filepath::IsAbs(item.Path) {
+        true => item.Path,
+        false => filepath::Join(absolute_base, item.Path),
+      }
+      let pattern = match item.Pattern.is_empty() {
+        true => "**/*.md",
+        false => item.Pattern,
+      }
+      try validate_qmd_pattern(name, "pattern", pattern)
+      let ignores = try qmd_ignore_patterns(name, item.Ignore)
+      let contexts: mut [sqlite::ConfigContext] = mut []
+      mut root_context = source.GlobalContext
+      for context in item.Contexts {
+        let prefix = strings::Trim(strings::TrimSpace(context.PathPrefix), "/")
+        if prefix.is_empty() {
+          root_context = context.Description
+        } else {
+          contexts.push(sqlite::ConfigContext{PathPrefix: prefix, Description: context.Description})
+        }
+      }
+      if not root_context.is_empty() {
+        contexts.push(sqlite::ConfigContext{PathPrefix: "", Description: root_context})
+      }
+      converted.push(
+        sqlite::ConfigCollection{
+          Name: name,
+          RootPath: root,
+          GlobPattern: pattern,
+          IgnorePatterns: ignores,
+          Contexts: contexts.@,
+        },
+      )
+      if not item.Update.is_empty() {
+        warnings.push("collection {name}: QMD update hook was not imported or executed")
+      }
+      if not included_by_default {
+        warnings.push(
+          "collection {name}: includeByDefault=false was explicitly broadened by --include-nondefault",
+        )
+      }
+    }
+  }
+  try testing::assert(
+    not replace or muted_collections == 0,
+    "--replace would omit {muted_collections} includeByDefault=false collection(s); also pass --include-nondefault",
+  ).map_err(validation_error)
+  let validated = try validate_config(
+    sqlite::ConfigFile{
+      Version: 1,
+      Collections: converted.@,
+      CollectionsPresent: true,
+    },
+  )
   let names: mut [Str] = mut []
   for collection in validated.Collections {
     names.push(collection.Name)
@@ -119,7 +282,7 @@ fn import_qmd_config(
     sqlite::QMDImportResult{
       Imported: imported,
       Collections: names.@,
-      Warnings: conversion.Warnings,
+      Warnings: warnings.@,
     },
   )
 }
