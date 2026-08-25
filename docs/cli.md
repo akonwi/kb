@@ -71,18 +71,6 @@ kb config import kb-config.json --replace
 
 Configuration JSON contains versioned collections, glob/ignore rules, and path contexts—not indexed documents. Import validates the complete file before applying it in one transaction. Normal import upserts included collections. Changing a root or glob/ignore rule invalidates that collection's old index so the next `update` rebuilds it. `--replace` also removes collections absent from the explicit `collections` array; this cascades their indexed documents.
 
-### QMD migration
-
-```sh
-kb config import-qmd
-kb config import-qmd ~/.config/qmd/index.yml
-kb config import-qmd --update
-kb config import-qmd ~/.config/qmd/index.yml --include-nondefault
-kb config import-qmd ~/.config/qmd/index.yml --replace --include-nondefault
-```
-
-This converts QMD collections, glob/ignore rules, and contexts. Project-local and standard global QMD config locations are auto-detected. Indexing is a separate `kb update` step unless `--update` is explicitly supplied. QMD's standard ignored directories are preserved. Model/editor settings, generated vector data, and update hooks are not imported; hooks are never executed. `includeByDefault=false` collections are skipped unless explicitly included. See [Migrating from QMD](qmd-migration.md) for mapping and validation details.
-
 ## Output and exit codes
 
 Commands use human-readable output by default. Commands supporting `--json` write one valid JSON value to stdout. Diagnostics and warnings go to stderr. Raw Markdown is emitted only by human `get` output.

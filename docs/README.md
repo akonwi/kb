@@ -22,7 +22,6 @@ Common statuses are `Proposed`, `Accepted`, `Deprecated`, and `Superseded`.
 
 - [Getting started](getting-started.md)
 - [CLI reference](cli.md)
-- [Migrating from QMD](qmd-migration.md)
 - [Data, backup, and recovery](data-management.md)
 - [Markdown indexing](markdown-indexing.md)
 - [Lexical search](search.md)

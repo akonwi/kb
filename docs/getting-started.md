@@ -159,22 +159,6 @@ kb config import ~/kb-config.json --replace
 
 Snapshots contain collection roots, glob/ignore rules, and contexts. They do not contain Markdown documents or indexed content.
 
-## Migrate from QMD
-
-```sh
-kb config import-qmd
-kb collection list
-kb update
-```
-
-For a trusted QMD config, import and index in one command:
-
-```sh
-kb config import-qmd --update
-```
-
-See [Migrating from QMD](qmd-migration.md) for auto-detection, safety behavior, and unsupported QMD settings.
-
 ## Database location
 
 The database is stored in the platform-native user data directory:

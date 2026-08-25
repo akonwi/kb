@@ -10,7 +10,7 @@ A fast, private, local knowledge base for Markdown. `kb` indexes directories int
 - Collection filters, snippets, path context, human output, and JSON output
 - Retrieval by virtual path or stable content-derived ID
 - One-based line ranges and numbered output
-- Configuration snapshots and direct QMD configuration migration
+- Versioned configuration snapshots with atomic import
 - SQLite integrity, FTS consistency, cleanup, and status commands
 - Bounded indexing memory and transaction sizes
 - No symbolic-link traversal, background service, or inference dependency
@@ -98,22 +98,8 @@ Line ranges are one-based and inclusive.
 | `kb cleanup [--vacuum]` | Remove stale data and optionally reclaim pages |
 | `kb config export FILE` | Export collection configuration |
 | `kb config import FILE` | Import collection configuration |
-| `kb config import-qmd` | Convert QMD collections and contexts |
 
 Run `kb help` or read the complete [CLI reference](docs/cli.md).
-
-## Migrate from QMD
-
-```sh
-# Auto-detect project-local or global QMD configuration
-kb config import-qmd
-
-# Review, then index
-kb collection list
-kb update
-```
-
-For a trusted configuration, `kb config import-qmd --update` imports and indexes in one command. QMD models, vectors, editor settings, and shell hooks are not imported; hooks are never executed. See [Migrating from QMD](docs/qmd-migration.md).
 
 ## Data and privacy
 
@@ -133,7 +119,6 @@ Set `KB_DATABASE` to override the complete path. `kb` reads source Markdown but 
 
 - [Getting started](docs/getting-started.md)
 - [CLI reference](docs/cli.md)
-- [Migrating from QMD](docs/qmd-migration.md)
 - [Data, backup, and recovery](docs/data-management.md)
 - [Markdown indexing behavior](docs/markdown-indexing.md)
 - [Lexical search behavior](docs/search.md)
