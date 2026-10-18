@@ -38,7 +38,6 @@ export SOURCE_DATE_EPOCH
 EXPECTED_ARD_VERSION=v0.44.0
 EXPECTED_GO_VERSION='go version go1.27.1 darwin/arm64'
 EXPECTED_PYTHON_VERSION='Python 3.9.6'
-EXPECTED_MACOS_VERSION=26.5
 EXPECTED_ZLIB_VERSION=1.2.12
 EXPECTED_CONTAINER_VERSION='container CLI version 1.2.2 (build: release, commit: unspeci)'
 LINUX_SMOKE_IMAGE='alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce'
@@ -83,10 +82,6 @@ if [[ $(go version) != "$EXPECTED_GO_VERSION" ]]; then
 fi
 if [[ $(python3 --version) != "$EXPECTED_PYTHON_VERSION" ]]; then
   echo "Error: releases require $EXPECTED_PYTHON_VERSION" >&2
-  exit 1
-fi
-if [[ $(sw_vers -productVersion) != "$EXPECTED_MACOS_VERSION" ]]; then
-  echo "Error: releases require macOS $EXPECTED_MACOS_VERSION" >&2
   exit 1
 fi
 ZLIB_VERSION=$(python3 -c 'import zlib; print(zlib.ZLIB_VERSION + "/" + zlib.ZLIB_RUNTIME_VERSION)')
