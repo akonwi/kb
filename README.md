@@ -28,7 +28,7 @@ Homebrew packages are available for macOS and Linux on arm64 and amd64. Prebuilt
 
 ### From source
 
-Building requires [Ard](https://ard.run) 0.38 or newer and Go 1.25 or newer:
+Building requires [Ard](https://ard.run) 0.44 or newer and Go 1.27 or newer:
 
 ```sh
 cd /path/to/kb

@@ -19,8 +19,8 @@ Homebrew selects the arm64 or amd64 package for the current system. Prebuilt arc
 
 Building requires:
 
-- [Ard](https://ard.run) 0.38 or newer
-- Go 1.25 or newer
+- [Ard](https://ard.run) 0.44 or newer
+- Go 1.27 or newer
 
 From a source checkout on macOS or Linux:
 

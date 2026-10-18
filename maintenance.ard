@@ -131,7 +131,7 @@ test fn reports_status_cleans_stale_rows_and_runs_doctor() Void!Str {
   ).map_err(error_message)
   let generation = try database.db.BeginUpdate(collection.ID).map_err(error_message)
   let _ = try database.db.FinalizeUpdate(collection.ID, generation).map_err(error_message)
-  
+
   let before = try status(database).map_err(error_message)
   try testing::assert(before.database.inactive_documents == 1, "expected inactive document")
   let removed = try cleanup(database, false).map_err(error_message)

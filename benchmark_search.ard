@@ -51,13 +51,13 @@ fn run_benchmark() Void!Error {
       420,
     )
   }
-  
+
   let database_path = "{database_dir}/index.sqlite"
   let database = try store::open_store(database_path)
   let _ = try database.migrate()
   let collection = try collections::create(database, "benchmark", root, "**/*.md", [])
   let _ = try index::update(database, collection, index::default_options())
-  
+
   let warm_started = time::Now()
   mut result_count = 0
   for mut iteration = 0; iteration < warm_iterations; iteration =+ 1 {
@@ -70,7 +70,7 @@ fn run_benchmark() Void!Error {
     warm_iterations,
   )
   try database.close()
-  
+
   let cold_started = time::Now()
   for mut iteration = 0; iteration < cold_connection_iterations; iteration =+ 1 {
     let opened = try store::open_store(database_path)
@@ -84,7 +84,7 @@ fn run_benchmark() Void!Error {
     cold_connection_iterations,
   )
   let info = try os::Stat(database_path)
-  
+
   fmt::Println("documents={document_count}")
   fmt::Println("warm_search_avg_ns={warm_average}")
   fmt::Println("cold_connection_search_avg_ns={cold_average}")

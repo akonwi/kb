@@ -260,7 +260,7 @@ test fn searches_ranked_filtered_documents_with_context() Void!Str {
     mut "# Rareterm elsewhere\n\nDifferent collection.".bytes(),
     420,
   ).map_err(error_message)
-  
+
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
@@ -283,7 +283,7 @@ test fn searches_ranked_filtered_documents_with_context() Void!Str {
     "guides",
     "Migration guides",
   ).map_err(error_message)
-  
+
   let alpha = try search(
     database,
     "rareterm",

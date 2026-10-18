@@ -126,7 +126,7 @@ test fn exports_and_atomically_imports_collection_configuration() Void!Str {
     exported.contains("\"version\": 1") and exported.contains("Guide context"),
     "expected versioned collection configuration",
   )
-  
+
   let target = try store::open_store("{directory}/target.sqlite").map_err(error_message)
   defer target.close()
   let _ = try target.migrate().map_err(error_message)

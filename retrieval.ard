@@ -170,7 +170,7 @@ test fn retrieves_by_virtual_path_and_stable_content_id() Void!Str {
     13,
     1,
   ).map_err(error_message)
-  
+
   let path_document = try get(database, "alpha/guide.md").map_err(error_message)
   try testing::assert(path_document.id == "abcdef1234567890", "expected short content ID")
   try testing::assert(path_document.content == "one\ntwo\nthree", "expected unchanged source")

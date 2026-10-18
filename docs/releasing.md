@@ -13,8 +13,8 @@ The release script also generates the formula used by [`akonwi/homebrew-tap`](ht
 
 - A clean `main` checkout
 - An arm64 Mac running macOS 26.5
-- Ard v0.39.0
-- Go 1.25.0
+- Ard v0.44.0
+- Go 1.27.1
 - Python 3.9.6 linked against zlib 1.2.12
 - Rosetta 2 for the macOS amd64 smoke test
 - [Apple Container](https://github.com/apple/container) 1.2.2 with its system service running for Linux arm64/amd64 smoke tests

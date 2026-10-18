@@ -237,7 +237,7 @@ fn start_writer(
     mut batch: [WriteItem] = []
     let batch_ref = mut batch
     mut running = true
-    
+
     while running {
       match changes.recv() {
         item => {
@@ -261,7 +261,7 @@ fn start_writer(
         _ => { running = false },
       }
     }
-    
+
     if message.is_empty() and batch_ref.size() > 0 {
       let flushed = flush_batch(db, collection_id, generation, batch_ref.@, budget)
       message = flushed.message
@@ -300,14 +300,14 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
   let budget = try fs::NewByteBudget(options.in_flight_bytes)
   let scanner = try fs::OpenScanner(collection.RootPath)
   defer scanner.Close()
-  
+
   let entries = Chan::new<fs::Entry>(options.entry_buffer)
   let jobs = Chan::new<ReadJob>(options.job_buffer)
   let changes = Chan::new<WriteItem>(options.change_buffer)
   let walk_done = Chan::new<StageDone>(1)
   let reader_done = Chan::new<StageDone>(options.readers)
   let writer_done = Chan::new<WriterDone>(1)
-  
+
   start_writer(
     database.db,
     collection.ID,
@@ -321,7 +321,7 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
     start_reader(jobs.receiver(), changes.sender(), reader_done.sender(), budget, scanner)
   }
   start_walk(scanner, collection, entries.sender(), walk_done.sender())
-  
+
   mut walked = 0
   mut unchanged = 0
   mut coordinator_error = ""
@@ -376,11 +376,11 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
       _ => { reading_entries = false },
     }
   }
-  
+
   let walked_done = walk_done.receiver().recv().expect("walker reports completion")
   coordinator_error = first_message(coordinator_error, walked_done.message)
   jobs.sender().close()
-  
+
   mut readers_finished = 0
   mut read_files = 0
   mut bytes_read = 0
@@ -397,7 +397,7 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
   if budget.Used() != 0 or not budget.Healthy() {
     coordinator_error = first_message(coordinator_error, "indexing byte-budget accounting failed")
   }
-  
+
   match coordinator_error.is_empty() {
     false => Result::err(Error::new(coordinator_error)),
     true => {
@@ -517,13 +517,13 @@ test fn incremental_update_skips_unchanged_and_removes_stale_documents() Void!St
     420,
   ).map_err(error_message)
   try os::WriteFile("{root}/ignored.txt", mut "ignored".bytes(), 420).map_err(error_message)
-  
+
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
   let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
   let options = default_options()
-  
+
   let initial = try update(database, collection, options).map_err(error_message)
   try testing::assert(
     initial.walked == 2 and initial.read == 2 and initial.inserted == 2,
@@ -531,7 +531,7 @@ test fn incremental_update_skips_unchanged_and_removes_stale_documents() Void!St
   )
   let unchanged = try update(database, collection, options).map_err(error_message)
   try testing::assert(unchanged.read == 0 and unchanged.unchanged == 2, "expected no-read update")
-  
+
   try os::Remove("{root}/nested/two.md").map_err(error_message)
   let removed = try update(database, collection, options).map_err(error_message)
   try testing::assert(removed.removed == 1, "expected stale document removal")
@@ -547,13 +547,13 @@ test fn failed_scan_does_not_deactivate_unseen_documents() Void!Str {
   defer os::RemoveAll(database_dir)
   try os::WriteFile("{root}/keep.md", mut "keep".bytes(), 420).map_err(error_message)
   try os::WriteFile("{root}/stale.md", mut "stale".bytes(), 420).map_err(error_message)
-  
+
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
   let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
   let _ = try update(database, collection, constrained_options(10)).map_err(error_message)
-  
+
   try os::Remove("{root}/stale.md").map_err(error_message)
   try os::WriteFile(
     "{root}/oversized.md",
@@ -577,7 +577,7 @@ test fn bounded_pipeline_handles_more_files_than_channel_capacity() Void!Str {
   for mut i = 0; i < 40; i =+ 1 {
     try os::WriteFile("{root}/doc-{i}.md", mut "document {i}".bytes(), 420).map_err(error_message)
   }
-  
+
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
@@ -654,18 +654,18 @@ test fn verify_rehashes_files_with_unchanged_metadata() Void!Str {
   let path = "{root}/doc.md"
   try os::WriteFile(path, mut "first body".bytes(), 420).map_err(error_message)
   let original = try os::Stat(path).map_err(error_message)
-  
+
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
   let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
   let _ = try update(database, collection, default_options()).map_err(error_message)
-  
+
   try os::WriteFile(path, mut "other body".bytes(), 420).map_err(error_message)
   try os::Chtimes(path, original.ModTime(), original.ModTime()).map_err(error_message)
   let skipped = try update(database, collection, default_options()).map_err(error_message)
   try testing::assert(skipped.read == 0, "normal update should trust unchanged metadata")
-  
+
   let verified = try update(database, collection, default_options(true)).map_err(error_message)
   try testing::assert(verified.read == 1 and verified.updated == 1, "verify must rehash the file")
   let matches = try database.db.Search("other", 10).map_err(error_message)

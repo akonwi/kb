@@ -61,7 +61,7 @@ fn measure_update(
     }
     done.sender().send(completed)
   })
-  
+
   mut result: UpdateDone? = Maybe::new()
   mut max_probe_ns = 0
   mut max_probe_wake_delay_ns = 0
@@ -134,13 +134,13 @@ fn run_benchmark() Void!Error {
   for mut i = 0; i < document_count; i =+ 1 {
     try os::WriteFile("{root}/document-{i}.md", mut "# Document {i}\n\n{body}".bytes(), 420)
   }
-  
+
   let database_path = "{database_dir}/index.sqlite"
   let database = try store::open_store(database_path)
   defer database.close()
   let _ = try database.migrate()
   let collection = try collections::create(database, "benchmark", root, "**/*.md", [])
-  
+
   let options = configured_options()
   let verify_options = configured_options(true)
   let initial = try measure_update(database, collection, options)
@@ -149,7 +149,7 @@ fn run_benchmark() Void!Error {
   let heap_bytes = benchmark_metrics::heap_alloc_bytes()
   try database.close()
   let info = try os::Stat(database_path)
-  
+
   try ensure_benchmark_correct(unchanged.stats, verified.stats)
   fmt::Println("documents={document_count}")
   fmt::Println("body_repeats={body_repeats}")
