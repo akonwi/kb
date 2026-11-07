@@ -23,7 +23,7 @@ fn create(
 ) sqlite::Collection!Error {
   let normalized_name = try normalize_name(name)
   let root = try fs::CanonicalDirectory(root_path)
-  let ignores: mut [Str] = mut []
+  let ignores: &mut [Str] = &mut []
   for pattern in ignore_patterns {
     ignores.push(pattern)
   }

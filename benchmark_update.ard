@@ -132,7 +132,7 @@ fn run_benchmark() Void!Error {
     body_repeats,
   )
   for mut i = 0; i < document_count; i =+ 1 {
-    try os::WriteFile("{root}/document-{i}.md", mut "# Document {i}\n\n{body}".bytes(), 420)
+    try os::WriteFile("{root}/document-{i}.md", &mut "# Document {i}\n\n{body}".bytes(), 420)
   }
 
   let database_path = "{database_dir}/index.sqlite"

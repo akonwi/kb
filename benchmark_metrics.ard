@@ -16,7 +16,7 @@ fn average_nanoseconds(elapsed: time::Duration, iterations: Int) Int {
 }
 
 fn heap_alloc_bytes() Int {
-  let stats = runtime::MemStats{}
-  runtime::ReadMemStats(mut stats)
+  mut stats = runtime::MemStats{}
+  runtime::ReadMemStats(&mut stats)
   strconv::Atoi(strconv::FormatUint(stats.HeapAlloc, 10)).expect("heap allocation fits Int")
 }

@@ -81,7 +81,7 @@ struct CollectionView {
 }
 
 fn collection_view(collection: sqlite::Collection) CollectionView {
-  let ignores: mut [Str] = mut []
+  let ignores: &mut [Str] = &mut []
   for pattern in collection.IgnorePatterns {
     ignores.push(pattern)
   }
@@ -89,7 +89,7 @@ fn collection_view(collection: sqlite::Collection) CollectionView {
     name: collection.Name,
     root_path: collection.RootPath,
     glob_pattern: collection.GlobPattern,
-    ignore_patterns: ignores.@,
+    ignore_patterns: ignores.*,
     created_at: collection.CreatedAt,
     updated_at: collection.UpdatedAt,
   }
@@ -102,7 +102,7 @@ fn command_collection(database: store::Store, args: [Str]) Void!Error {
       let name = try require_arg(args, 3, "collection name")
       let root = try require_arg(args, 4, "collection root")
       mut glob = "**/*.md"
-      let ignores: mut [Str] = mut []
+      let ignores: &mut [Str] = &mut []
       mut index_value = 5
       while index_value < args.size() {
         let option = args.at(index_value).expect("bounded argument")
@@ -118,19 +118,19 @@ fn command_collection(database: store::Store, args: [Str]) Void!Error {
           _ => try reject_usage("unknown collection add option: {option}"),
         }
       }
-      let created = try collections::create(database, name, root, glob, ignores.@)
+      let created = try collections::create(database, name, root, glob, ignores.*)
       fmt::Println("added {safe(created.Name)} ({safe(created.RootPath)})")
       Result::ok(())
     },
     "list" => {
       let as_json = try optional_json(args, 3, "collection list")
       let source = try collections::list(database)
-      let output: mut [CollectionView] = mut []
+      let output: &mut [CollectionView] = &mut []
       for item in source {
         output.push(collection_view(item))
       }
       match as_json {
-        true => print_json_bytes(try json::Marshal(output.@)),
+        true => print_json_bytes(try json::Marshal(output.*)),
         false => {
           for item in output {
             fmt::Println("{safe(item.name)}\t{safe(item.root_path)}\t{safe(item.glob_pattern)}")
@@ -223,7 +223,7 @@ fn command_update(database: store::Store, args: [Str]) Void!Error {
 
 fn command_search(database: store::Store, args: [Str]) Void!Error {
   mut query = ""
-  let selected: mut [Str] = mut []
+  let selected: &mut [Str] = &mut []
   mut limit = 10
   mut as_json = false
   mut argument_index = 2
@@ -261,7 +261,7 @@ fn command_search(database: store::Store, args: [Str]) Void!Error {
       },
     }
   }
-  let results = try search::search(database, query, search::SearchOptions{collections: selected.@, limit: limit})
+  let results = try search::search(database, query, search::SearchOptions{collections: selected.*, limit: limit})
   match as_json {
     true => fmt::Println(try search::format_json(results)),
     false => fmt::Println(search::format_human(results)),
@@ -419,7 +419,7 @@ fn command_config(database: store::Store, args: [Str]) Void!Error {
       let content = try config::export_config(database)
       match output {
         "-" => fmt::Print(content),
-        _ => try os::WriteFile(output, mut content.bytes(), 420),
+        _ => try os::WriteFile(output, &mut content.bytes(), 420),
       }
       Result::ok(())
     },

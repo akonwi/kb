@@ -47,7 +47,7 @@ fn run_benchmark() Void!Error {
     }
     try os::WriteFile(
       "{root}/document-{i}.md",
-      mut "# Technical note {i}\n\n{topic}\n\n{filler}".bytes(),
+      &mut "# Technical note {i}\n\n{topic}\n\n{filler}".bytes(),
       420,
     )
   }

@@ -5,7 +5,7 @@ use go:os
 use go:path/filepath
 
 struct Store {
-  db: mut sqlite::DB,
+  db: &mut sqlite::DB,
 }
 
 fn migrations() [sqlite::Migration] {
@@ -183,7 +183,7 @@ impl Store {
   }
 
   fn add_collection(name: Str, root_path: Str, glob_pattern: Str) sqlite::Collection!Error {
-    let ignores: mut [Str] = mut []
+    let ignores: &mut [Str] = &mut []
     self.db.InsertCollection(name, root_path, glob_pattern, ignores)
   }
 
@@ -255,7 +255,7 @@ test fn generation_migration_upgrades_existing_index() Void!Str {
   let _ = try database.db.ApplyMigration(plan.at(2).expect("migration three")).map_err(error_message)
   let _ = try database.db.ApplyMigration(plan.at(3).expect("migration four")).map_err(error_message)
   let generation = try database.db.BeginUpdate(collection.ID).map_err(error_message)
-  let changes: mut [sqlite::IndexChange] = mut [
+  let changes: &mut [sqlite::IndexChange] = &mut [
     sqlite::IndexChange{
       RelativePath: "existing.md",
       Title: "",

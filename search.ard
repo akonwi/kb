@@ -12,8 +12,8 @@ use go:regexp
 use go:strings
 use go:unicode/utf8
 
-let query_tokens: mut regexp::Regexp = regexp::MustCompile(`"[^"]*"|[^\s\p{{Z}}]+`)
-let terminal_controls: mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
+let query_tokens: &mut regexp::Regexp = regexp::MustCompile(`"[^"]*"|[^\s\p{{Z}}]+`)
+let terminal_controls: &mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
 let max_search_markdown_bytes = 64 * 1_024 * 1_024
 
 struct SearchOptions {
@@ -123,12 +123,12 @@ fn require_collection(lookup: sqlite::CollectionLookup, name: Str) Int!Error {
 }
 
 fn collection_ids(database: store::Store, names: [Str]) [Int]!Error {
-  let identifiers: mut [Int] = mut []
+  let identifiers: &mut [Int] = &mut []
   for name in names {
     let lookup = try database.db.LookupCollection(name)
     identifiers.push(try require_collection(lookup, name))
   }
-  Result::ok(identifiers.@)
+  Result::ok(identifiers.*)
 }
 
 fn score(rank: Float64) Float64 {
@@ -158,12 +158,12 @@ fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Er
   try validate_limit(options.limit)
   let expression = try build_fts_query(query)
   let identifiers = try collection_ids(database, options.collections)
-  let ids: mut [Int] = mut []
+  let ids: &mut [Int] = &mut []
   for identifier in identifiers {
     ids.push(identifier)
   }
   let rows = try database.db.SearchIndex(expression, ids, options.limit)
-  let matches: mut [Match] = mut []
+  let matches: &mut [Match] = &mut []
   mut total_markdown_bytes = 0
   for row in rows {
     total_markdown_bytes =+ row.Markdown.bytes().size()
@@ -184,7 +184,7 @@ fn search(database: store::Store, query: Str, options: SearchOptions) [Match]!Er
       },
     )
   }
-  Result::ok(matches.@)
+  Result::ok(matches.*)
 }
 
 fn safe_terminal(value: Str) Str {
@@ -247,17 +247,17 @@ test fn searches_ranked_filtered_documents_with_context() Void!Str {
   try os::MkdirAll("{root_a}/guides", 493).map_err(error_message)
   try os::WriteFile(
     "{root_a}/guides/title.md",
-    mut "# Rareterm guide\n\nSchema migration workflow.".bytes(),
+    &mut "# Rareterm guide\n\nSchema migration workflow.".bytes(),
     420,
   ).map_err(error_message)
   try os::WriteFile(
     "{root_a}/body.md",
-    mut "# Other guide\n\nRareterm appears in the body.".bytes(),
+    &mut "# Other guide\n\nRareterm appears in the body.".bytes(),
     420,
   ).map_err(error_message)
   try os::WriteFile(
     "{root_b}/other.md",
-    mut "# Rareterm elsewhere\n\nDifferent collection.".bytes(),
+    &mut "# Rareterm elsewhere\n\nDifferent collection.".bytes(),
     420,
   ).map_err(error_message)
 

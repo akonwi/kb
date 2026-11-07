@@ -6,7 +6,7 @@ use go:path/filepath
 use go:regexp
 use go:runtime
 
-let terminal_controls: mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
+let terminal_controls: &mut regexp::Regexp = regexp::MustCompile(`[\x00-\x1f\x7f-\x9f]`)
 
 fn name() Str {
   "kb"
@@ -174,13 +174,13 @@ test fn preserves_an_existing_legacy_database() Void!Str {
   let desired = filepath::Join(directory, "native", "index.sqlite")
   let legacy = filepath::Join(directory, "legacy", "index.sqlite")
   try os::MkdirAll(filepath::Dir(legacy), 448).map_err(error_message)
-  try os::WriteFile(legacy, mut "legacy".bytes(), 384).map_err(error_message)
+  try os::WriteFile(legacy, &mut "legacy".bytes(), 384).map_err(error_message)
   try testing::assert(
     (try prefer_existing_legacy_database(desired, legacy).map_err(error_message)) == legacy,
     "expected existing legacy database fallback",
   )
   try os::MkdirAll(filepath::Dir(desired), 448).map_err(error_message)
-  try os::WriteFile(desired, mut "native".bytes(), 384).map_err(error_message)
+  try os::WriteFile(desired, &mut "native".bytes(), 384).map_err(error_message)
   try testing::assert(
     (try prefer_existing_legacy_database(desired, legacy).map_err(error_message)) == desired,
     "native database must take precedence",

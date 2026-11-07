@@ -101,13 +101,13 @@ fn validate_options(options: UpdateOptions) Void!Error {
 }
 
 fn start_walk(
-  scanner: mut fs::Scanner,
+  scanner: &mut fs::Scanner,
   collection: sqlite::Collection,
   entries: Sender<fs::Entry>,
   done: Sender<StageDone>,
 ) {
   async::start(fn() {
-    let ignores: mut [Str] = mut []
+    let ignores: &mut [Str] = &mut []
     for pattern in collection.IgnorePatterns {
       ignores.push(pattern)
     }
@@ -130,8 +130,8 @@ fn start_reader(
   jobs: Receiver<ReadJob>,
   changes: Sender<WriteItem>,
   done: Sender<StageDone>,
-  budget: mut fs::ByteBudget,
-  scanner: mut fs::Scanner,
+  budget: &mut fs::ByteBudget,
+  scanner: &mut fs::Scanner,
 ) {
   async::start(fn() {
     mut message = ""
@@ -184,13 +184,13 @@ fn start_reader(
 }
 
 fn flush_batch(
-  db: mut sqlite::DB,
+  db: &mut sqlite::DB,
   collection_id: Int,
   generation: Int,
   items: [WriteItem],
-  budget: mut fs::ByteBudget,
+  budget: &mut fs::ByteBudget,
 ) FlushResult {
-  let changes: mut [sqlite::IndexChange] = mut []
+  let changes: &mut [sqlite::IndexChange] = &mut []
   for item in items {
     changes.push(item.change)
   }
@@ -219,12 +219,12 @@ fn flush_batch(
 }
 
 fn start_writer(
-  db: mut sqlite::DB,
+  db: &mut sqlite::DB,
   collection_id: Int,
   generation: Int,
   changes: Receiver<WriteItem>,
   done: Sender<WriterDone>,
-  budget: mut fs::ByteBudget,
+  budget: &mut fs::ByteBudget,
   options: UpdateOptions,
 ) {
   async::start(fn() {
@@ -235,7 +235,7 @@ fn start_writer(
     mut batches = 0
     mut batch_bytes = 0
     mut batch: [WriteItem] = []
-    let batch_ref = mut batch
+    let batch_ref = &mut batch
     mut running = true
 
     while running {
@@ -245,7 +245,7 @@ fn start_writer(
             batch_ref.push(item)
             batch_bytes =+ item.reserved_bytes
             if batch_ref.size() >= options.batch_size or batch_bytes >= options.batch_bytes {
-              let flushed = flush_batch(db, collection_id, generation, batch_ref.@, budget)
+              let flushed = flush_batch(db, collection_id, generation, batch_ref.*, budget)
               message = flushed.message
               inserted =+ flushed.inserted
               updated =+ flushed.updated
@@ -263,7 +263,7 @@ fn start_writer(
     }
 
     if message.is_empty() and batch_ref.size() > 0 {
-      let flushed = flush_batch(db, collection_id, generation, batch_ref.@, budget)
+      let flushed = flush_batch(db, collection_id, generation, batch_ref.*, budget)
       message = flushed.message
       inserted =+ flushed.inserted
       updated =+ flushed.updated
@@ -292,7 +292,7 @@ fn first_message(current: Str, candidate: Str) Str {
 fn update(database: store::Store, collection: sqlite::Collection, options: UpdateOptions) UpdateStats!Error {
   try validate_options(options)
   let metadata_rows = try database.db.ListDocumentMetadata(collection.ID)
-  let metadata: mut [Str: sqlite::DocumentMetadata] = mut [:]
+  let metadata: &mut [Str: sqlite::DocumentMetadata] = &mut [:]
   for document in metadata_rows {
     metadata.set(document.RelativePath, document)
   }
@@ -429,7 +429,7 @@ test fn extraction_version_refreshes_unchanged_documents() Void!Str {
   let database_dir = try os::MkdirTemp("", "kb-index-extraction-version-db-").map_err(error_message)
   defer os::RemoveAll(database_dir)
   let source = "# Current title\n\nvisible extracted text"
-  try os::WriteFile("{root}/legacy.md", mut source.bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/legacy.md", &mut source.bytes(), 420).map_err(error_message)
   let scanner = try fs::OpenScanner(root).map_err(error_message)
   let entry = try scanner.Inspect("legacy.md").map_err(error_message)
   try scanner.Close().map_err(error_message)
@@ -471,7 +471,7 @@ test fn markdown_extraction_preserves_source_and_indexes_visible_text() Void!Str
   let database_dir = try os::MkdirTemp("", "kb-index-markdown-db-").map_err(error_message)
   defer os::RemoveAll(database_dir)
   let source = "---\nprivate_token: should_not_be_searchable\n---\n# Visible title\n\nFind the [public label](https://private.example) and `code_token`."
-  try os::WriteFile("{root}/document.md", mut source.bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/document.md", &mut source.bytes(), 420).map_err(error_message)
   // Index through the complete reader and writer pipeline.
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
@@ -509,14 +509,18 @@ test fn incremental_update_skips_unchanged_and_removes_stale_documents() Void!St
   defer os::RemoveAll(root)
   let database_dir = try os::MkdirTemp("", "kb-index-db-").map_err(error_message)
   defer os::RemoveAll(database_dir)
-  try os::WriteFile("{root}/one.md", mut "# One\n\nSQLite migrations".bytes(), 420).map_err(error_message)
+  try os::WriteFile(
+    "{root}/one.md",
+    &mut "# One\n\nSQLite migrations".bytes(),
+    420,
+  ).map_err(error_message)
   try os::MkdirAll("{root}/nested", 493).map_err(error_message)
   try os::WriteFile(
     "{root}/nested/two.md",
-    mut "# Two\n\nArd channels".bytes(),
+    &mut "# Two\n\nArd channels".bytes(),
     420,
   ).map_err(error_message)
-  try os::WriteFile("{root}/ignored.txt", mut "ignored".bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/ignored.txt", &mut "ignored".bytes(), 420).map_err(error_message)
 
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
@@ -545,8 +549,8 @@ test fn failed_scan_does_not_deactivate_unseen_documents() Void!Str {
   defer os::RemoveAll(root)
   let database_dir = try os::MkdirTemp("", "kb-index-failure-db-").map_err(error_message)
   defer os::RemoveAll(database_dir)
-  try os::WriteFile("{root}/keep.md", mut "keep".bytes(), 420).map_err(error_message)
-  try os::WriteFile("{root}/stale.md", mut "stale".bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/keep.md", &mut "keep".bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/stale.md", &mut "stale".bytes(), 420).map_err(error_message)
 
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
@@ -557,7 +561,7 @@ test fn failed_scan_does_not_deactivate_unseen_documents() Void!Str {
   try os::Remove("{root}/stale.md").map_err(error_message)
   try os::WriteFile(
     "{root}/oversized.md",
-    mut "this file is too large".bytes(),
+    &mut "this file is too large".bytes(),
     420,
   ).map_err(error_message)
   try testing::assert(
@@ -575,7 +579,7 @@ test fn bounded_pipeline_handles_more_files_than_channel_capacity() Void!Str {
   let database_dir = try os::MkdirTemp("", "kb-index-bounded-db-").map_err(error_message)
   defer os::RemoveAll(database_dir)
   for mut i = 0; i < 40; i =+ 1 {
-    try os::WriteFile("{root}/doc-{i}.md", mut "document {i}".bytes(), 420).map_err(error_message)
+    try os::WriteFile("{root}/doc-{i}.md", &mut "document {i}".bytes(), 420).map_err(error_message)
   }
 
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
@@ -605,14 +609,14 @@ test fn indexes_large_and_unicode_paths_without_following_symlinks() Void!Str {
   let unicode_path = "日本語/naïve 🧠.md"
   try os::WriteFile(
     "{root}/{unicode_path}",
-    mut "# Unicode path\n\nsearchable_unicode_marker".bytes(),
+    &mut "# Unicode path\n\nsearchable_unicode_marker".bytes(),
     420,
   ).map_err(error_message)
   if runtime::GOOS != "windows" {
     try os::Symlink("{root}/{unicode_path}", "{root}/alias.md").map_err(error_message)
   }
   let large_source = "# Large boundary\n\n{strings::Repeat("large_boundary_marker ", 50_000)}"
-  try os::WriteFile("{root}/large.md", mut large_source.bytes(), 420).map_err(error_message)
+  try os::WriteFile("{root}/large.md", &mut large_source.bytes(), 420).map_err(error_message)
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
@@ -635,7 +639,7 @@ test fn indexes_large_and_unicode_paths_without_following_symlinks() Void!Str {
   )
   try os::WriteFile(
     "{root}/large.md",
-    mut strings::Repeat("z", large_source.bytes().size() + 1).bytes(),
+    &mut strings::Repeat("z", large_source.bytes().size() + 1).bytes(),
     420,
   ).map_err(error_message)
   try testing::assert(update(database, collection, limits).is_err(), "expected over-limit file rejection")
@@ -652,7 +656,7 @@ test fn verify_rehashes_files_with_unchanged_metadata() Void!Str {
   let database_dir = try os::MkdirTemp("", "kb-index-verify-db-").map_err(error_message)
   defer os::RemoveAll(database_dir)
   let path = "{root}/doc.md"
-  try os::WriteFile(path, mut "first body".bytes(), 420).map_err(error_message)
+  try os::WriteFile(path, &mut "first body".bytes(), 420).map_err(error_message)
   let original = try os::Stat(path).map_err(error_message)
 
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
@@ -661,7 +665,7 @@ test fn verify_rehashes_files_with_unchanged_metadata() Void!Str {
   let collection = try collections::create(database, "notes", root, "**/*.md", []).map_err(error_message)
   let _ = try update(database, collection, default_options()).map_err(error_message)
 
-  try os::WriteFile(path, mut "other body".bytes(), 420).map_err(error_message)
+  try os::WriteFile(path, &mut "other body".bytes(), 420).map_err(error_message)
   try os::Chtimes(path, original.ModTime(), original.ModTime()).map_err(error_message)
   let skipped = try update(database, collection, default_options()).map_err(error_message)
   try testing::assert(skipped.read == 0, "normal update should trust unchanged metadata")

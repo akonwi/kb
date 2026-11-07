@@ -34,13 +34,13 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
     source.CollectionsPresent,
     "config collections must be an explicit JSON array",
   ).map_err(validation_error)
-  let names: mut [Str] = mut []
-  let validated: mut [sqlite::ConfigCollection] = mut []
+  let names: &mut [Str] = &mut []
+  let validated: &mut [sqlite::ConfigCollection] = &mut []
   for item in source.Collections {
     let name = try collections::normalize_name(item.Name)
     let name_key = strings::ToLower(name)
     try testing::assert(
-      not contains(names.@, name_key),
+      not contains(names.*, name_key),
       "duplicate collection name {name}",
     ).map_err(validation_error)
     names.push(name_key)
@@ -53,7 +53,7 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
       not item.GlobPattern.is_empty(),
       "collection {name} has an empty glob",
     ).map_err(validation_error)
-    let ignores: mut [Str] = mut []
+    let ignores: &mut [Str] = &mut []
     for pattern in item.IgnorePatterns {
       try testing::assert(
         not pattern.is_empty(),
@@ -62,8 +62,8 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
       ignores.push(pattern)
     }
     try fs::ValidatePatterns(item.GlobPattern, ignores)
-    let prefixes: mut [Str] = mut []
-    let contexts: mut [sqlite::ConfigContext] = mut []
+    let prefixes: &mut [Str] = &mut []
+    let contexts: &mut [sqlite::ConfigContext] = &mut []
     for context in item.Contexts {
       let prefix = strings::Trim(strings::TrimSpace(context.PathPrefix), "/")
       try testing::assert(
@@ -71,7 +71,7 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
         "collection {name} has invalid context prefix {prefix}",
       ).map_err(validation_error)
       try testing::assert(
-        not contains(prefixes.@, prefix),
+        not contains(prefixes.*, prefix),
         "collection {name} has duplicate context prefix {prefix}",
       ).map_err(validation_error)
       prefixes.push(prefix)
@@ -82,15 +82,15 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
         Name: name,
         RootPath: root,
         GlobPattern: item.GlobPattern,
-        IgnorePatterns: ignores.@,
-        Contexts: contexts.@,
+        IgnorePatterns: ignores.*,
+        Contexts: contexts.*,
       },
     )
   }
   Result::ok(
     sqlite::ConfigFile{
       Version: source.Version,
-      Collections: validated.@,
+      Collections: validated.*,
       CollectionsPresent: true,
     },
   )
@@ -118,7 +118,7 @@ test fn exports_and_atomically_imports_collection_configuration() Void!Str {
     "notes",
     canonical_root,
     "**/*.md",
-    mut ["archive/**"],
+    &mut ["archive/**"],
   ).map_err(error_message)
   try source.db.UpsertCollectionContext(collection.ID, "guides", "Guide context").map_err(error_message)
   let exported = try export_config(source).map_err(error_message)

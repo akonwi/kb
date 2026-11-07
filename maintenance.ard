@@ -28,7 +28,7 @@ struct Status {
 
 fn status(database: store::Store) Status!Error {
   let source = try database.db.ReadStatus()
-  let collections: mut [CollectionStatus] = mut []
+  let collections: &mut [CollectionStatus] = &mut []
   for collection in source.Collections {
     collections.push(
       CollectionStatus{
@@ -51,7 +51,7 @@ fn status(database: store::Store) Status!Error {
         content_bytes: source.Database.ContentBytes,
         fts_rows: source.Database.FTSRows,
       },
-      collections: collections.@,
+      collections: collections.*,
     },
   )
 }
@@ -83,7 +83,7 @@ struct Check {
 
 fn doctor(database: store::Store) [Check]!Error {
   let source = try database.db.Doctor()
-  let checks: mut [Check] = mut []
+  let checks: &mut [Check] = &mut []
   for check in source {
     checks.push(
       Check{
@@ -93,7 +93,7 @@ fn doctor(database: store::Store) [Check]!Error {
       },
     )
   }
-  Result::ok(checks.@)
+  Result::ok(checks.*)
 }
 
 fn healthy(checks: [Check]) Bool {

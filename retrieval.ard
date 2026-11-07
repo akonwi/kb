@@ -7,7 +7,7 @@ use go:os
 use go:regexp
 use go:strings
 
-let content_id_pattern: mut regexp::Regexp = regexp::MustCompile(`^[0-9a-f]+$`)
+let content_id_pattern: &mut regexp::Regexp = regexp::MustCompile(`^[0-9a-f]+$`)
 
 struct GetOptions {
   start_line: Int,
