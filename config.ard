@@ -136,9 +136,9 @@ test fn exports_and_atomically_imports_collection_configuration() Void!Str {
   )
   let round_trip = try export_config(target).map_err(error_message)
   try testing::assert(round_trip == exported, "expected deterministic round trip")
-  let imported_collection = try target.db.LookupCollection("notes").map_err(error_message)
+  let imported_collection = try collections::show(target, "notes").map_err(error_message)
   let _ = try target.add_document(
-    imported_collection.Collection.ID,
+    imported_collection.ID,
     "old.md",
     "Old",
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",

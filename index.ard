@@ -480,17 +480,11 @@ test fn markdown_extraction_preserves_source_and_indexes_visible_text() Void!Str
   let indexed = try update(database, collection, default_options()).map_err(error_message)
   try testing::assert(indexed.inserted == 1, "expected Markdown document indexing")
   // Retrieval must retain source while FTS receives only derived text.
-  let content = try database.db.LookupDocumentContent(collection.ID, "document.md").map_err(error_message)
+  let markdown, searchable_text, found = try database.db.LookupDocumentContent(collection.ID, "document.md").map_err(error_message)
+  try testing::assert(found and markdown == source, "original Markdown must remain unchanged")
+  try testing::assert(not searchable_text.contains("private_token"), "frontmatter must not be searchable")
   try testing::assert(
-    content.Found and content.Markdown == source,
-    "original Markdown must remain unchanged",
-  )
-  try testing::assert(
-    not content.SearchableText.contains("private_token"),
-    "frontmatter must not be searchable",
-  )
-  try testing::assert(
-    not content.SearchableText.contains("private.example"),
+    not searchable_text.contains("private.example"),
     "link destination must not be searchable",
   )
   try testing::assert(
@@ -627,12 +621,10 @@ test fn indexes_large_and_unicode_paths_without_following_symlinks() Void!Str {
     indexed.walked == 2 and indexed.inserted == 2,
     "expected Unicode and boundary-sized files while ignoring the symlink",
   )
-  let unicode = try database.db.LookupDocumentByPath("notes", unicode_path).map_err(error_message)
-  try testing::assert(unicode.Found, "expected exact Unicode virtual-path retrieval")
-  try testing::assert(
-    (try database.db.LookupDocumentByPath("notes", "alias.md").map_err(error_message)).Found == false,
-    "symlink must not enter the index",
-  )
+  let _, unicode_found = try database.db.LookupDocumentByPath("notes", unicode_path).map_err(error_message)
+  try testing::assert(unicode_found, "expected exact Unicode virtual-path retrieval")
+  let _, alias_found = try database.db.LookupDocumentByPath("notes", "alias.md").map_err(error_message)
+  try testing::assert(not alias_found, "symlink must not enter the index")
   try testing::assert(
     (try database.db.Search("large_boundary_marker", 10).map_err(error_message)).size() == 1,
     "expected boundary-sized content in FTS",

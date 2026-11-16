@@ -141,12 +141,7 @@ fn command_collection(database: store::Store, args: [Str]) Void!Error {
     },
     "show" => {
       let name = try require_arg(args, 3, "collection name")
-      let lookup = try collections::show(database, name)
-      let found = match lookup.Found {
-        true => Result::ok(lookup.Collection),
-        false => Result::err(Error::new("collection not found: {name}")),
-      }
-      let item = collection_view(try found)
+      let item = collection_view(try collections::show(database, name))
       let as_json = try optional_json(args, 4, "collection show")
       match as_json {
         true => print_json_bytes(try json::Marshal(item)),
@@ -203,12 +198,7 @@ fn command_update(database: store::Store, args: [Str]) Void!Error {
   let options = index::default_options(verify)
   match name.is_empty() {
     false => {
-      let lookup = try collections::show(database, name)
-      let collection = match lookup.Found {
-        true => Result::ok(lookup.Collection),
-        false => Result::err(Error::new("collection not found: {name}")),
-      }
-      let selected = try collection
+      let selected = try collections::show(database, name)
       print_update(selected.Name, try index::update(database, selected, options))
     },
     true => {

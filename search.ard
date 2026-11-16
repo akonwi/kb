@@ -3,7 +3,6 @@ use ard/testing
 use go:encoding/json
 use go:fmt
 use kb/collections
-use go:kb/ffi/sqlite
 use kb/index
 use kb/store
 use go:math
@@ -115,18 +114,10 @@ fn build_fts_query(input: Str) Str!Error {
   }
 }
 
-fn require_collection(lookup: sqlite::CollectionLookup, name: Str) Int!Error {
-  match lookup.Found {
-    true => Result::ok(lookup.Collection.ID),
-    false => Result::err(Error::new("collection not found: {name}")),
-  }
-}
-
 fn collection_ids(database: store::Store, names: [Str]) [Int]!Error {
   let identifiers: &mut [Int] = &mut []
   for name in names {
-    let lookup = try database.db.LookupCollection(name)
-    identifiers.push(try require_collection(lookup, name))
+    identifiers.push((try collections::show(database, name)).ID)
   }
   Result::ok(identifiers.*)
 }

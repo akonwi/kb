@@ -90,31 +90,37 @@ fn normalize_content_id(value: Str) Str!Error {
   }
 }
 
-fn lookup_document(database: store::Store, selector: Str) sqlite::RetrievalLookup!Error {
+fn find_document(database: store::Store, selector: Str) sqlite::RetrievedDocument!Error {
   let collection, relative_path, is_path = strings::Cut(selector, "/")
   match is_path {
-    false => database.db.LookupDocumentByContentID(try normalize_content_id(selector)),
+    false => {
+      match try database.db.LookupDocumentByContentID(try normalize_content_id(selector)) {
+        (document, 1) => Result::ok(document),
+        (_, 0) => Result::err(document_not_found(selector)),
+        _ => Result::err(Error::new("document ID is ambiguous: {selector}")),
+      }
+    },
     true => {
       match collection.is_empty() or relative_path.is_empty() {
         true => Result::err(Error::new("virtual path must be collection/relative-path")),
-        false => database.db.LookupDocumentByPath(collection, relative_path),
+        false => {
+          match try database.db.LookupDocumentByPath(collection, relative_path) {
+            (document, true) => Result::ok(document),
+            (_, false) => Result::err(document_not_found(selector)),
+          }
+        },
       }
     },
   }
 }
 
-fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::RetrievedDocument!Error {
-  match (lookup.Ambiguous, lookup.Found) {
-    (true, _) => Result::err(Error::new("document ID is ambiguous: {selector}")),
-    (false, true) => Result::ok(lookup.Document),
-    (false, false) => Result::err(Error::new("document not found: {selector}")),
-  }
+private fn document_not_found(selector: Str) Error {
+  Error::new("document not found: {selector}")
 }
 
 fn get(database: store::Store, selector: Str, options: GetOptions?) Document!Error {
   let configured = options.or(default_options())
-  let lookup = try lookup_document(database, selector)
-  let source = try require_document(lookup, selector)
+  let source = try find_document(database, selector)
   let content = try render_lines(source.Markdown, configured.start_line, configured.end_line, configured.numbered)
   Result::ok(
     Document{
@@ -186,6 +192,13 @@ test fn retrieves_by_virtual_path_and_stable_content_id() Void!Str {
   testing::pass()
 }
 
+private fn get_error(database: store::Store, selector: Str) Str {
+  match get(database, selector) {
+    ok(_) => "",
+    err(error) => error.error(),
+  }
+}
+
 test fn rejects_ambiguous_or_invalid_content_ids_and_ranges() Void!Str {
   let directory = try os::MkdirTemp("", "kb-retrieval-ambiguous-").map_err(error_message)
   defer os::RemoveAll(directory)
@@ -213,7 +226,18 @@ test fn rejects_ambiguous_or_invalid_content_ids_and_ranges() Void!Str {
     3,
     1,
   ).map_err(error_message)
-  try testing::assert(get(database, "12345678").is_err(), "expected ambiguous ID")
+  try testing::assert(
+    get_error(database, "12345678") == "document ID is ambiguous: 12345678",
+    "expected ambiguous ID",
+  )
+  try testing::assert(
+    get_error(database, "12345679") == "document not found: 12345679",
+    "expected unknown ID",
+  )
+  try testing::assert(
+    get_error(database, "notes/three.md") == "document not found: notes/three.md",
+    "expected missing path",
+  )
   try testing::assert(get(database, "not-an-id").is_err(), "expected invalid ID")
   try testing::assert(get(database, "1234").is_err(), "expected short ID rejection")
   try testing::assert(
