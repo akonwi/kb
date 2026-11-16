@@ -21,12 +21,6 @@ type Collection struct {
 	UpdatedAt      string
 }
 
-// CollectionLookup avoids a nullable foreign pointer at the Ard boundary.
-type CollectionLookup struct {
-	Found      bool
-	Collection Collection
-}
-
 // DocumentRecord is a document persisted in the core schema.
 type DocumentRecord struct {
 	ID           int
@@ -99,21 +93,22 @@ func (db *DB) ListCollections() ([]Collection, error) {
 	return collections, nil
 }
 
-// LookupCollection finds a collection by its case-insensitive name.
-func (db *DB) LookupCollection(name string) (CollectionLookup, error) {
+// LookupCollection finds a collection by its case-insensitive name. found is
+// false when no collection has that name.
+func (db *DB) LookupCollection(name string) (collection Collection, found bool, err error) {
 	row := db.conn.QueryRowContext(context.Background(), `
 		SELECT id, name, root_path, glob_pattern, ignore_patterns, created_at, updated_at
 		FROM collections
 		WHERE name = ? COLLATE NOCASE
 	`, name)
-	collection, err := scanCollection(row)
+	collection, err = scanCollection(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return CollectionLookup{}, nil
+			return Collection{}, false, nil
 		}
-		return CollectionLookup{}, err
+		return Collection{}, false, err
 	}
-	return CollectionLookup{Found: true, Collection: collection}, nil
+	return collection, true, nil
 }
 
 // DeleteCollectionByName removes a collection and its cascaded documents.

@@ -35,8 +35,11 @@ fn list(database: store::Store) [sqlite::Collection]!Error {
   database.db.ListCollections()
 }
 
-fn show(database: store::Store, name: Str) sqlite::CollectionLookup!Error {
-  database.db.LookupCollection(name)
+fn show(database: store::Store, name: Str) sqlite::Collection!Error {
+  match try database.db.LookupCollection(name) {
+    (collection, true) => Result::ok(collection),
+    (_, false) => Result::err(Error::new("collection not found: {name}")),
+  }
 }
 
 fn remove(database: store::Store, name: Str) Bool!Error {
@@ -66,15 +69,9 @@ test fn collection_operations_use_canonical_directories() Void!Str {
   try testing::assert(created.IgnorePatterns.size() == 1, "expected typed ignore patterns")
 
   let found = try show(database, "NOTES").map_err(error_message)
-  try testing::assert(
-    found.Found and found.Collection.ID == created.ID,
-    "expected case-insensitive lookup",
-  )
+  try testing::assert(found.ID == created.ID, "expected case-insensitive lookup")
   try testing::assert((try list(database).map_err(error_message)).size() == 1, "expected collection list")
   try testing::assert(try remove(database, "notes").map_err(error_message), "expected collection removal")
-  try testing::assert(
-    not (try show(database, "notes").map_err(error_message)).Found,
-    "expected removed collection",
-  )
+  try testing::assert(show(database, "notes").is_err(), "expected removed collection")
   testing::pass()
 }

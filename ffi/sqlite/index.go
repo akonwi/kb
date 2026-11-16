@@ -38,13 +38,6 @@ type BatchStats struct {
 	Seen     int
 }
 
-// ContentLookup returns original and derived content without nullable pointers.
-type ContentLookup struct {
-	Found          bool
-	Markdown       string
-	SearchableText string
-}
-
 // ListDocumentMetadata returns all known paths, including inactive documents
 // that may reappear.
 func (db *DB) ListDocumentMetadata(collectionID int) ([]DocumentMetadata, error) {
@@ -81,23 +74,22 @@ func (db *DB) ListDocumentMetadata(collectionID int) ([]DocumentMetadata, error)
 	return metadata, rows.Err()
 }
 
-// LookupDocumentContent returns stored source and derived text for an active path.
-func (db *DB) LookupDocumentContent(collectionID int, relativePath string) (ContentLookup, error) {
-	var content ContentLookup
-	err := db.conn.QueryRowContext(context.Background(), `
+// LookupDocumentContent returns stored source and derived text for an active
+// path. found is false when no active document has that path.
+func (db *DB) LookupDocumentContent(collectionID int, relativePath string) (markdown, searchableText string, found bool, err error) {
+	err = db.conn.QueryRowContext(context.Background(), `
 		SELECT content.markdown, content.searchable_text
 		FROM documents
 		JOIN content ON content.hash = documents.content_hash
 		WHERE documents.collection_id = ? AND documents.relative_path = ? AND documents.active = 1
-	`, collectionID, relativePath).Scan(&content.Markdown, &content.SearchableText)
+	`, collectionID, relativePath).Scan(&markdown, &searchableText)
 	if err == sql.ErrNoRows {
-		return ContentLookup{}, nil
+		return "", "", false, nil
 	}
 	if err != nil {
-		return ContentLookup{}, err
+		return "", "", false, err
 	}
-	content.Found = true
-	return content, nil
+	return markdown, searchableText, true, nil
 }
 
 // BeginUpdate advances and returns the generation owned by a new scan.

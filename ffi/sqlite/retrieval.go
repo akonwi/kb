@@ -17,13 +17,6 @@ type RetrievedDocument struct {
 	ModifiedAt   string
 }
 
-// RetrievalLookup represents found, absent, and ambiguous short-ID lookups.
-type RetrievalLookup struct {
-	Found     bool
-	Ambiguous bool
-	Document  RetrievedDocument
-}
-
 func scanRetrieved(scanner interface{ Scan(...any) error }) (RetrievedDocument, error) {
 	var document RetrievedDocument
 	err := scanner.Scan(
@@ -42,9 +35,10 @@ func scanRetrieved(scanner interface{ Scan(...any) error }) (RetrievedDocument, 
 	return document, nil
 }
 
-// LookupDocumentByPath retrieves one active document by collection and relative path.
-func (db *DB) LookupDocumentByPath(collection, relativePath string) (RetrievalLookup, error) {
-	document, err := scanRetrieved(db.conn.QueryRowContext(context.Background(), `
+// LookupDocumentByPath retrieves one active document by collection and
+// relative path. found is false when no active document has that path.
+func (db *DB) LookupDocumentByPath(collection, relativePath string) (document RetrievedDocument, found bool, err error) {
+	document, err = scanRetrieved(db.conn.QueryRowContext(context.Background(), `
 		SELECT content.hash, collections.name, documents.relative_path, documents.title,
 		       content.markdown, documents.size_bytes, documents.updated_at
 		FROM documents
@@ -55,18 +49,20 @@ func (db *DB) LookupDocumentByPath(collection, relativePath string) (RetrievalLo
 		  AND documents.active = 1
 	`, collection, relativePath))
 	if err == sql.ErrNoRows {
-		return RetrievalLookup{}, nil
+		return RetrievedDocument{}, false, nil
 	}
 	if err != nil {
-		return RetrievalLookup{}, err
+		return RetrievedDocument{}, false, err
 	}
-	return RetrievalLookup{Found: true, Document: document}, nil
+	return document, true, nil
 }
 
 // LookupDocumentByContentID retrieves content by a validated, lowercase hash
 // prefix. Duplicate paths with the same complete hash are aliases, while a
-// prefix that identifies multiple complete hashes is ambiguous.
-func (db *DB) LookupDocumentByContentID(prefix string) (RetrievalLookup, error) {
+// prefix that identifies multiple complete hashes is ambiguous. matches is 0
+// when nothing matches, 1 when document holds the match, and 2 when the
+// prefix is ambiguous.
+func (db *DB) LookupDocumentByContentID(prefix string) (document RetrievedDocument, matches int, err error) {
 	rows, err := db.conn.QueryContext(context.Background(), `
 		SELECT DISTINCT content_hash
 		FROM documents
@@ -75,28 +71,25 @@ func (db *DB) LookupDocumentByContentID(prefix string) (RetrievalLookup, error) 
 		LIMIT 2
 	`, prefix)
 	if err != nil {
-		return RetrievalLookup{}, err
+		return RetrievedDocument{}, 0, err
 	}
 	defer rows.Close()
 	hashes := make([]string, 0, 2)
 	for rows.Next() {
 		var hash string
 		if err := rows.Scan(&hash); err != nil {
-			return RetrievalLookup{}, err
+			return RetrievedDocument{}, 0, err
 		}
 		hashes = append(hashes, hash)
 	}
 	if err := rows.Err(); err != nil {
-		return RetrievalLookup{}, err
+		return RetrievedDocument{}, 0, err
 	}
-	if len(hashes) == 0 {
-		return RetrievalLookup{}, nil
-	}
-	if len(hashes) > 1 {
-		return RetrievalLookup{Ambiguous: true}, nil
+	if len(hashes) != 1 {
+		return RetrievedDocument{}, len(hashes), nil
 	}
 
-	document, err := scanRetrieved(db.conn.QueryRowContext(context.Background(), `
+	document, err = scanRetrieved(db.conn.QueryRowContext(context.Background(), `
 		SELECT content.hash, collections.name, documents.relative_path, documents.title,
 		       content.markdown, documents.size_bytes, documents.updated_at
 		FROM documents
@@ -107,7 +100,7 @@ func (db *DB) LookupDocumentByContentID(prefix string) (RetrievalLookup, error) 
 		LIMIT 1
 	`, hashes[0]))
 	if err != nil {
-		return RetrievalLookup{}, err
+		return RetrievedDocument{}, 0, err
 	}
-	return RetrievalLookup{Found: true, Document: document}, nil
+	return document, 1, nil
 }
