@@ -13,18 +13,14 @@ let warm_iterations = 500
 let cold_connection_iterations = 25
 
 fn require_results(results: [search::Match]) Void!Error {
-  let first = results.at(0)
-  let valid = results.size() == 10 and first.map(fn(item: search::Match) Str {
-    item.collection
-  }).or("") == "benchmark" and (not first.map(fn(item: search::Match) Str {
-    item.markdown
-  }).or("").is_empty() and not first.map(fn(item: search::Match) Str {
-    item.snippet
-  }).or("").is_empty() and first.map(fn(item: search::Match) Float64 {
-    item.score
-  }).or(-1.0) >= 0.0 and first.map(fn(item: search::Match) Float64 {
-    item.score
-  }).or(2.0) < 1.0)
+  let valid = match results.at(0) {
+    some(first) => {
+      let has_text = not first.markdown.is_empty() and not first.snippet.is_empty()
+      let score_in_range = first.score >= 0.0 and first.score < 1.0
+      results.size() == 10 and first.collection == "benchmark" and has_text and score_in_range
+    },
+    none => false,
+  }
   match valid {
     true => Result::ok(()),
     false => Result::err(Error::new("search benchmark result validation failed")),
