@@ -1,0 +1,268 @@
+use ard/async
+use ard/testing
+use ard/unsafe
+
+use go:github.com/yuin/goldmark
+use go:github.com/yuin/goldmark/ast
+use go:github.com/yuin/goldmark/extension
+use go:github.com/yuin/goldmark/extension/ast as extast
+use go:github.com/yuin/goldmark/text
+use go:github.com/yuin/goldmark/util
+use go:path/filepath
+use go:strconv
+use go:strings
+
+// Changes whenever derived title or searchable-text semantics change.
+let version = 1
+
+let parser = goldmark::New(goldmark::WithExtensions(extension::GFM)).Parser()
+
+let backslash: Byte = 92
+let space: Byte = 32
+
+// The title and visible searchable text derived from a Markdown document.
+struct Document {
+  title: Str,
+  searchable_text: Str,
+}
+
+// Extracts a title and visible searchable text. The original source is
+// retained separately by the indexing pipeline.
+fn parse(source: Str, filename: Str) Document {
+  let body = strings::TrimPrefix(strip_frontmatter(source), "\ufeff")
+  let bytes = body.bytes()
+  let document = parser.Parse(text::NewReader(bytes))
+  let extracted = &mut Extracted{
+    source: bytes,
+    title: "",
+    output: [],
+  }
+  extract_blocks(extracted, document)
+  let title = match extracted.title.is_empty() {
+    false => extracted.title,
+    true => {
+      let base = filepath::Base(filename)
+      strings::TrimSuffix(base, filepath::Ext(base))
+    },
+  }
+  Document{title: title, searchable_text: strings::Join(extracted.output, "\n")}
+}
+
+fn strip_frontmatter(source: Str) Str {
+  let lines = strings::Split(source, "\n")
+  let first = strings::TrimSuffix(strings::TrimPrefix(lines.at(0).or(""), "\ufeff"), "\r")
+  match lines.size() < 3 or first != "---" {
+    true => source,
+    false => {
+      mut stripped = source
+      mut has_field = false
+      mut searching = true
+      for line, index in lines {
+        let raw_line = strings::TrimSuffix(line, "\r")
+        if searching and index > 0 {
+          if raw_line == "---" or raw_line == "..." {
+            searching = false
+            if has_field {
+              stripped = strings::Join(
+                lines.slice(start: index + 1).expect("index is in bounds").to_list(),
+                "\n",
+              )
+            }
+          } else if strings::Contains(strings::TrimSpace(raw_line), ":") {
+            has_field = true
+          }
+        }
+      }
+      stripped
+    },
+  }
+}
+
+private struct Extracted {
+  source: [Byte],
+  title: Str,
+  output: [Str],
+}
+
+private fn append_text(extracted: &mut Extracted, value: Str) {
+  let normalized = strings::Join(strings::Fields(value), " ")
+  if not normalized.is_empty() {
+    extracted.output.push(normalized)
+  }
+}
+
+private fn extract_blocks(extracted: &mut Extracted, node: ast::Node) {
+  mut child = node.FirstChild()
+  while not unsafe::is_nil(child) {
+    let kind = child.Kind()
+    if kind == ast::KindHeading {
+      let value = inline_text(extracted.source, child)
+      if extracted.title.is_empty() {
+        extracted.title = strings::Join(strings::Fields(value), " ")
+      }
+      append_text(extracted, value)
+    } else if kind == ast::KindParagraph or kind == ast::KindTextBlock or kind == extast::KindTableCell {
+      append_text(extracted, inline_text(extracted.source, child))
+    } else if kind == ast::KindFencedCodeBlock or kind == ast::KindCodeBlock {
+      append_text(extracted, raw_lines(extracted.source, child))
+    } else if kind == ast::KindHTMLBlock or kind == ast::KindThematicBreak {
+      // Raw HTML is markup rather than visible text, and rules are structural.
+      ()
+    } else {
+      extract_blocks(extracted, child)
+    }
+    child = child.NextSibling()
+  }
+}
+
+private fn inline_text(source: [Byte], node: ast::Node) Str {
+  let builder = &mut strings::Builder{}
+  write_inline(builder, source, node)
+  builder.String()
+}
+
+private fn write_inline(builder: &mut strings::Builder, source: [Byte], node: ast::Node) {
+  mut child = node.FirstChild()
+  while not unsafe::is_nil(child) {
+    let kind = child.Kind()
+    if kind == ast::KindText {
+      let value = unsafe::cast<&mut ast::Text>(child).expect("text node")
+      builder.Write(visible_text(value.Segment.Value(source)))
+      if value.SoftLineBreak() or value.HardLineBreak() {
+        builder.WriteByte(space)
+      }
+    } else if kind == ast::KindString {
+      let value = unsafe::cast<&mut ast::String>(child).expect("string node")
+      builder.Write(visible_text(value.Value))
+    } else if kind == ast::KindCodeSpan {
+      mut part = child.FirstChild()
+      while not unsafe::is_nil(part) {
+        match unsafe::cast<&mut ast::Text>(part) {
+          value => builder.Write(value.Segment.Value(source)),
+          _ => (),
+        }
+        part = part.NextSibling()
+      }
+    } else if kind == ast::KindAutoLink {
+      let link = unsafe::cast<&mut ast::AutoLink>(child).expect("autolink node")
+      builder.Write(link.Label(source))
+    } else if kind == ast::KindRawHTML {
+      // Inline markup is not visible text.
+      ()
+    } else {
+      write_inline(builder, source, child)
+    }
+    child = child.NextSibling()
+  }
+}
+
+// Resolves entities and drops backslashes that escape punctuation.
+private fn visible_text(source: [Byte]) [Byte] {
+  let resolved = util::ResolveEntityNames(source)
+  let output: &mut [Byte] = &mut []
+  mut escaped = false
+  for byte, index in resolved {
+    if escaped {
+      output.push(byte)
+      escaped = false
+    } else if byte == backslash and util::IsPunct(resolved.at(index + 1).or(Byte::from(0))) {
+      escaped = true
+    } else {
+      output.push(byte)
+    }
+  }
+  output.*
+}
+
+private fn raw_lines(source: [Byte], node: ast::Node) Str {
+  let builder = &mut strings::Builder{}
+  let lines = node.Lines()
+  mut index = 0
+  while index < lines.Len() {
+    mut segment = lines.At(index)
+    builder.Write((&mut segment).Value(source))
+    index =+ 1
+  }
+  builder.String()
+}
+
+private fn expect_document(actual: Document, title: Str, searchable_text: Str) Void!Str {
+  try testing::assert(actual.title == title, "unexpected title {strconv::Quote(actual.title)}")
+  testing::assert(
+    actual.searchable_text == searchable_text,
+    "unexpected searchable text {strconv::Quote(actual.searchable_text)}",
+  )
+}
+
+test fn extracts_visible_text_from_a_complete_document() Void!Str {
+  let source = "---\ntitle: Frontmatter title\ntags: [private, metadata]\n---\n\n# Searchable title\n\nA paragraph with **bold text**, [visible link](https://secret.example/path), and `inline_code`.\n\n> Quoted knowledge.\n\n- first item\n- second item\n\n```go\nfunc indexedCode() string {{ return \"code token\" }}\n```\n\n| Name | Purpose |\n| --- | --- |\n| FTS5 | lexical search |\n"
+  expect_document(
+    parse(source, "complete.md"),
+    "Searchable title",
+    "Searchable title\nA paragraph with bold text, visible link, and inline_code.\nQuoted knowledge.\nfirst item\nsecond item\nfunc indexedCode() string {{ return \"code token\" }}\nName\nPurpose\nFTS5\nlexical search",
+  )
+}
+
+test fn titles_fall_back_to_the_file_name() Void!Str {
+  try expect_document(parse("", "notes/empty.md"), "empty", "")
+  expect_document(
+    parse(
+      "A document without a heading.\n\nVisit <https://ard.run> for details.\n",
+      "no-heading.md",
+    ),
+    "no-heading",
+    "A document without a heading.\nVisit https://ard.run for details.",
+  )
+}
+
+test fn rendered_text_resolves_entities_escapes_and_visible_autolinks() Void!Str {
+  expect_document(
+    parse("# A &amp; B\n\n\\*literal\\* www.example.com", "text.md"),
+    "A & B",
+    "A & B\n*literal* www.example.com",
+  )
+}
+
+test fn frontmatter_requires_unindented_closing_delimiter() Void!Str {
+  let source = "\ufeff---\r\ntitle: hidden\r\nnote: |\r\n  value\r\n  ---\r\nsecret: metadata\r\n---\r\n# Visible\r\n"
+  expect_document(parse(source, "frontmatter.md"), "Visible", "Visible")
+}
+
+test fn setext_heading_supplies_title() Void!Str {
+  expect_document(
+    parse("Setext title\n============\n\nBody", "setext.md"),
+    "Setext title",
+    "Setext title\nBody",
+  )
+}
+
+test fn top_rule_without_frontmatter_fields_is_searchable() Void!Str {
+  expect_document(
+    parse("---\n\nVisible paragraph\n\n---\n", "rule.md"),
+    "rule",
+    "Visible paragraph",
+  )
+}
+
+test fn parses_concurrently() Void!Str {
+  let results = Chan::new<Bool>(32)
+  for _ in 1..32 {
+    async::start(fn() {
+      mut valid = true
+      for _ in 1..100 {
+        let actual = parse("# Concurrent\n\nVisible **text**", "concurrent.md")
+        if actual.title != "Concurrent" or not actual.searchable_text.contains("Visible text") {
+          valid = false
+        }
+      }
+      results.send(valid)
+    })
+  }
+  mut all_valid = true
+  for _ in 1..32 {
+    if not results.recv().expect("parser reports completion") {
+      all_valid = false
+    }
+  }
+  testing::assert(all_valid, "unexpected concurrent result")
+}

@@ -1,7 +1,7 @@
 use ard/testing
 
-use go:kb/ffi/fs
 use go:kb/ffi/sqlite
+use kb/files
 use kb/store
 use go:os
 use go:strings
@@ -22,12 +22,12 @@ fn create(
   ignore_patterns: [Str],
 ) sqlite::Collection!Error {
   let normalized_name = try normalize_name(name)
-  let root = try fs::CanonicalDirectory(root_path)
+  let root = try files::canonical_directory(root_path)
   let ignores: &mut [Str] = &mut []
   for pattern in ignore_patterns {
     ignores.push(pattern)
   }
-  try fs::ValidatePatterns(glob_pattern, ignores)
+  try files::validate_patterns(glob_pattern, ignore_patterns)
   database.db.InsertCollection(normalized_name, root, glob_pattern, ignores)
 }
 
@@ -60,7 +60,7 @@ test fn collection_operations_use_canonical_directories() Void!Str {
   defer database.close()
   let _ = try database.migrate().map_err(error_message)
   let created = try create(database, "notes", root, "**/*.md", ["archive/**"]).map_err(error_message)
-  let canonical = try fs::CanonicalDirectory(root).map_err(error_message)
+  let canonical = try files::canonical_directory(root).map_err(error_message)
   try testing::assert(created.RootPath == canonical, "expected canonical root")
   try testing::assert(
     create(database, "invalid/name", root, "**/*.md", []).is_err(),

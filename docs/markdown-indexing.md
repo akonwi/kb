@@ -1,6 +1,6 @@
 # Markdown indexing
 
-The index retains each Markdown file exactly as read for document retrieval. A focused Go adapter built on Goldmark CommonMark with GFM extensions derives two search values from new or changed files:
+The index retains each Markdown file exactly as read for document retrieval. The `markdown.ard` module, built on Goldmark CommonMark with GFM extensions, derives two search values from new or changed files:
 
 - `Title`: the first heading at any level, falling back to the filename without its extension.
 - `SearchableText`: visible block text separated by newlines.
@@ -18,4 +18,4 @@ Extraction follows these rules:
 
 Whitespace inside each extracted block is normalized for stable output, HTML entities and Markdown punctuation escapes are resolved, and frontmatter handles BOM/CRLF input while requiring an unindented closing delimiter.
 
-Derived text carries an extraction version in SQLite. Increasing that version causes an otherwise unchanged document to be reread and refreshes its title, searchable text, and FTS row. Normally, the indexer invokes extraction only after filesystem metadata identifies a file as new or changed, when verification forces a reread, or when this extraction version changes.
+Derived text carries an extraction version (`markdown::version`) in SQLite. Increasing that version causes an otherwise unchanged document to be reread and refreshes its title, searchable text, and FTS row. Normally, the indexer invokes extraction only after filesystem metadata identifies a file as new or changed, when verification forces a reread, or when this extraction version changes.
