@@ -91,12 +91,10 @@ fn normalize_content_id(value: Str) Str!Error {
 }
 
 fn lookup_document(database: store::Store, selector: Str) sqlite::RetrievalLookup!Error {
-  let parts = strings::SplitN(selector, "/", 2)
-  match parts.size() == 1 {
-    true => database.db.LookupDocumentByContentID(try normalize_content_id(selector)),
-    false => {
-      let collection = parts.at(0).expect("split collection")
-      let relative_path = parts.at(1).expect("split relative path")
+  let collection, relative_path, is_path = strings::Cut(selector, "/")
+  match is_path {
+    false => database.db.LookupDocumentByContentID(try normalize_content_id(selector)),
+    true => {
       match collection.is_empty() or relative_path.is_empty() {
         true => Result::err(Error::new("virtual path must be collection/relative-path")),
         false => database.db.LookupDocumentByPath(collection, relative_path),
@@ -106,14 +104,10 @@ fn lookup_document(database: store::Store, selector: Str) sqlite::RetrievalLooku
 }
 
 fn require_document(lookup: sqlite::RetrievalLookup, selector: Str) sqlite::RetrievedDocument!Error {
-  match lookup.Ambiguous {
-    true => Result::err(Error::new("document ID is ambiguous: {selector}")),
-    false => {
-      match lookup.Found {
-        true => Result::ok(lookup.Document),
-        false => Result::err(Error::new("document not found: {selector}")),
-      }
-    },
+  match (lookup.Ambiguous, lookup.Found) {
+    (true, _) => Result::err(Error::new("document ID is ambiguous: {selector}")),
+    (false, true) => Result::ok(lookup.Document),
+    (false, false) => Result::err(Error::new("document not found: {selector}")),
   }
 }
 
