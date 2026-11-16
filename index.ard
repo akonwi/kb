@@ -2,8 +2,9 @@ use ard/async
 use ard/testing
 
 use kb/collections
-use go:kb/ffi/fs
 use go:kb/ffi/sqlite
+use kb/files
+use kb/markdown
 use kb/store
 use go:os
 use go:runtime
@@ -50,7 +51,7 @@ private fn constrained_options(max_file_bytes: Int) UpdateOptions {
 }
 
 struct ReadJob {
-  entry: fs::Entry,
+  entry: files::Entry,
   reserved_bytes: Int,
 }
 
@@ -101,17 +102,13 @@ fn validate_options(options: UpdateOptions) Void!Error {
 }
 
 fn start_walk(
-  scanner: &mut fs::Scanner,
+  scanner: files::Scanner,
   collection: sqlite::Collection,
-  entries: Sender<fs::Entry>,
+  entries: Sender<files::Entry>,
   done: Sender<StageDone>,
 ) {
   async::start(fn() {
-    let ignores: &mut [Str] = &mut []
-    for pattern in collection.IgnorePatterns {
-      ignores.push(pattern)
-    }
-    let message = match scanner.Walk(collection.GlobPattern, ignores, entries) {
+    let message = match scanner.walk(collection.GlobPattern, collection.IgnorePatterns, entries) {
       ok => "",
       err(error) => "walk {collection.RootPath}: {error.error()}",
     }
@@ -130,8 +127,8 @@ fn start_reader(
   jobs: Receiver<ReadJob>,
   changes: Sender<WriteItem>,
   done: Sender<StageDone>,
-  budget: &mut fs::ByteBudget,
-  scanner: &mut fs::Scanner,
+  budget: &mut files::ByteBudget,
+  scanner: files::Scanner,
 ) {
   async::start(fn() {
     mut message = ""
@@ -141,31 +138,31 @@ fn start_reader(
     while running {
       match jobs.recv() {
         job => {
-          match scanner.ReadAndHash(job.entry) {
+          match scanner.read_and_hash(job.entry) {
             ok(read) => {
               files =+ 1
-              bytes =+ read.SizeBytes
+              bytes =+ read.size_bytes
               changes.send(
                 WriteItem{
                   change: sqlite::IndexChange{
-                    RelativePath: read.RelativePath,
-                    Title: read.Title,
-                    ContentHash: read.Hash,
-                    Markdown: read.Markdown,
-                    SearchableText: read.SearchableText,
-                    SizeBytes: read.SizeBytes,
-                    MtimeNS: read.MtimeNS,
+                    RelativePath: read.relative_path,
+                    Title: read.title,
+                    ContentHash: read.hash,
+                    Markdown: read.markdown,
+                    SearchableText: read.searchable_text,
+                    SizeBytes: read.size_bytes,
+                    MtimeNS: read.mtime_ns,
                     HasContent: true,
-                    ExtractionVersion: fs::MarkdownExtractionVersion(),
+                    ExtractionVersion: markdown::version,
                   },
                   reserved_bytes: job.reserved_bytes,
                 },
               )
             },
             err(error) => {
-              budget.Release(job.reserved_bytes)
+              budget.release(job.reserved_bytes)
               if message.is_empty() {
-                message = "read {job.entry.RelativePath}: {error.error()}"
+                message = "read {job.entry.relative_path}: {error.error()}"
               }
             },
           }
@@ -188,7 +185,7 @@ fn flush_batch(
   collection_id: Int,
   generation: Int,
   items: [WriteItem],
-  budget: &mut fs::ByteBudget,
+  budget: &mut files::ByteBudget,
 ) FlushResult {
   let changes: &mut [sqlite::IndexChange] = &mut []
   for item in items {
@@ -196,7 +193,7 @@ fn flush_batch(
   }
   let applied = db.ApplyIndexBatch(collection_id, generation, changes)
   for item in items {
-    budget.Release(item.reserved_bytes)
+    budget.release(item.reserved_bytes)
   }
   match applied {
     ok(stats) => {
@@ -224,7 +221,7 @@ fn start_writer(
   generation: Int,
   changes: Receiver<WriteItem>,
   done: Sender<WriterDone>,
-  budget: &mut fs::ByteBudget,
+  budget: &mut files::ByteBudget,
   options: UpdateOptions,
 ) {
   async::start(fn() {
@@ -255,7 +252,7 @@ fn start_writer(
               batch_bytes = 0
             }
           } else {
-            budget.Release(item.reserved_bytes)
+            budget.release(item.reserved_bytes)
           }
         },
         _ => { running = false },
@@ -297,11 +294,11 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
     metadata.set(document.RelativePath, document)
   }
   let generation = try database.db.BeginUpdate(collection.ID)
-  let budget = try fs::NewByteBudget(options.in_flight_bytes)
-  let scanner = try fs::OpenScanner(collection.RootPath)
-  defer scanner.Close()
+  let budget = try files::new_byte_budget(options.in_flight_bytes)
+  let scanner = try files::open_scanner(collection.RootPath)
+  defer scanner.close()
 
-  let entries = Chan::new<fs::Entry>(options.entry_buffer)
+  let entries = Chan::new<files::Entry>(options.entry_buffer)
   let jobs = Chan::new<ReadJob>(options.job_buffer)
   let changes = Chan::new<WriteItem>(options.change_buffer)
   let walk_done = Chan::new<StageDone>(1)
@@ -330,25 +327,25 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
     match entries.receiver().recv() {
       entry => {
         walked =+ 1
-        let should_read = match metadata.get(entry.RelativePath) {
+        let should_read = match metadata.get(entry.relative_path) {
           existing => {
-            options.verify or existing.SizeBytes != entry.SizeBytes or existing.MtimeNS != entry.MtimeNS or existing.ExtractionVersion != fs::MarkdownExtractionVersion()
+            options.verify or existing.SizeBytes != entry.size_bytes or existing.MtimeNS != entry.mtime_ns or existing.ExtractionVersion != markdown::version
           },
           _ => true,
         }
         if should_read {
-          if entry.SizeBytes > options.max_file_bytes {
+          if entry.size_bytes > options.max_file_bytes {
             coordinator_error = first_message(
               coordinator_error,
-              "file {entry.RelativePath} exceeds maximum size {options.max_file_bytes}",
+              "file {entry.relative_path} exceeds maximum size {options.max_file_bytes}",
             )
           } else {
-            match budget.Reserve(entry.SizeBytes) {
+            match budget.reserve(entry.size_bytes) {
               ok(reserved) => jobs.sender().send(ReadJob{entry: entry, reserved_bytes: reserved}),
               err(error) => {
                 coordinator_error = first_message(
                   coordinator_error,
-                  "reserve {entry.RelativePath}: {error.error()}",
+                  "reserve {entry.relative_path}: {error.error()}",
                 )
               },
             }
@@ -358,13 +355,13 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
           changes.sender().send(
             WriteItem{
               change: sqlite::IndexChange{
-                RelativePath: entry.RelativePath,
+                RelativePath: entry.relative_path,
                 Title: "",
                 ContentHash: "",
                 Markdown: "",
                 SearchableText: "",
-                SizeBytes: entry.SizeBytes,
-                MtimeNS: entry.MtimeNS,
+                SizeBytes: entry.size_bytes,
+                MtimeNS: entry.mtime_ns,
                 HasContent: false,
                 ExtractionVersion: 0,
               },
@@ -394,7 +391,7 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
   changes.sender().close()
   let written = writer_done.receiver().recv().expect("writer reports completion")
   coordinator_error = first_message(coordinator_error, written.message)
-  if budget.Used() != 0 or not budget.Healthy() {
+  if budget.used_bytes() != 0 or not budget.healthy() {
     coordinator_error = first_message(coordinator_error, "indexing byte-budget accounting failed")
   }
 
@@ -412,7 +409,7 @@ fn update(database: store::Store, collection: sqlite::Collection, options: Updat
           updated: written.updated,
           removed: removed,
           batches: written.batches,
-          peak_in_flight_bytes: budget.Peak(),
+          peak_in_flight_bytes: budget.peak_bytes(),
         },
       )
     },
@@ -430,9 +427,9 @@ test fn extraction_version_refreshes_unchanged_documents() Void!Str {
   defer os::RemoveAll(database_dir)
   let source = "# Current title\n\nvisible extracted text"
   try os::WriteFile("{root}/legacy.md", &mut source.bytes(), 420).map_err(error_message)
-  let scanner = try fs::OpenScanner(root).map_err(error_message)
-  let entry = try scanner.Inspect("legacy.md").map_err(error_message)
-  try scanner.Close().map_err(error_message)
+  let scanner = try files::open_scanner(root).map_err(error_message)
+  let entry = try scanner.inspect("legacy.md").map_err(error_message)
+  try scanner.close().map_err(error_message)
   // Seed a document using the pre-versioned extraction state.
   let database = try store::open_store("{database_dir}/index.sqlite").map_err(error_message)
   defer database.close()
@@ -445,8 +442,8 @@ test fn extraction_version_refreshes_unchanged_documents() Void!Str {
     "legacy-hash",
     source,
     "raw_marker_from_old_extractor",
-    entry.SizeBytes,
-    entry.MtimeNS,
+    entry.size_bytes,
+    entry.mtime_ns,
   ).map_err(error_message)
   // A normal metadata-stable update must still refresh derived text.
   let refreshed = try update(database, collection, default_options()).map_err(error_message)

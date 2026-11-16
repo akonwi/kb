@@ -1,8 +1,8 @@
 use ard/testing
 
 use kb/collections
-use go:kb/ffi/fs
 use go:kb/ffi/sqlite
+use kb/files
 use kb/store
 use go:os
 use go:strings
@@ -48,7 +48,7 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
       not item.RootPath.is_empty(),
       "collection {name} root_path is required",
     ).map_err(validation_error)
-    let root = try fs::CanonicalDirectory(item.RootPath)
+    let root = try files::canonical_directory(item.RootPath)
     try testing::assert(
       not item.GlobPattern.is_empty(),
       "collection {name} has an empty glob",
@@ -61,7 +61,7 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
       ).map_err(validation_error)
       ignores.push(pattern)
     }
-    try fs::ValidatePatterns(item.GlobPattern, ignores)
+    try files::validate_patterns(item.GlobPattern, ignores.*)
     let prefixes: &mut [Str] = &mut []
     let contexts: &mut [sqlite::ConfigContext] = &mut []
     for context in item.Contexts {
@@ -113,7 +113,7 @@ test fn exports_and_atomically_imports_collection_configuration() Void!Str {
   let source = try store::open_store("{directory}/source.sqlite").map_err(error_message)
   defer source.close()
   let _ = try source.migrate().map_err(error_message)
-  let canonical_root = try fs::CanonicalDirectory(root).map_err(error_message)
+  let canonical_root = try files::canonical_directory(root).map_err(error_message)
   let collection = try source.db.InsertCollection(
     "notes",
     canonical_root,

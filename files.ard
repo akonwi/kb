@@ -1,0 +1,554 @@
+use ard/async
+use ard/testing
+use ard/unsafe
+
+use go:crypto/sha256
+use go:encoding/hex
+use go:github.com/bmatcuk/doublestar/v4 as doublestar
+use go:io
+use go:io/fs as iofs
+use kb/markdown
+use go:os
+use go:path/filepath
+use go:runtime
+use go:strconv
+use go:strings
+use go:sync
+use go:time
+
+// Filesystem metadata collected without opening a document body.
+struct Entry {
+  root_path: Str,
+  relative_path: Str,
+  absolute_path: Str,
+  size_bytes: Int,
+  mtime_ns: Int,
+}
+
+// A stable document read with its content hash and derived search values.
+struct ReadResult {
+  relative_path: Str,
+  title: Str,
+  hash: Str,
+  markdown: Str,
+  searchable_text: Str,
+  size_bytes: Int,
+  mtime_ns: Int,
+}
+
+// Pins a collection root descriptor for one complete update.
+struct Scanner {
+  root_path: Str,
+  root: &mut os::Root,
+}
+
+// Resolves a directory to an absolute, symlink-free path.
+fn canonical_directory(path: Str) Str!Error {
+  let absolute = try filepath::Abs(path)
+  let resolved = try filepath::EvalSymlinks(absolute)
+  let info = try os::Stat(resolved)
+  try require(info.IsDir(), "{strconv::Quote(path)} is not a directory")
+  Result::ok(resolved)
+}
+
+// Checks the include and ignore patterns before an update.
+fn validate_patterns(pattern: Str, ignores: [Str]) Void!Error {
+  try validate_pattern(pattern)
+  for ignore in ignores {
+    try validate_pattern(ignore)
+  }
+  Result::ok(())
+}
+
+// Opens and pins a canonical collection root.
+fn open_scanner(path: Str) Scanner!Error {
+  let canonical = try canonical_directory(path)
+  let root = try os::OpenRoot(canonical)
+  Result::ok(Scanner{root_path: canonical, root: root})
+}
+
+impl Scanner {
+  // Releases the pinned collection root. Closing twice is harmless.
+  fn close() Void!Error {
+    self.root.Close()
+  }
+
+  // Returns current metadata for one relative path under the pinned root.
+  fn inspect(relative_path: Str) Entry!Error {
+    let relative = filepath::ToSlash(relative_path)
+    let info = try self.root.Stat(filepath::FromSlash(relative))
+    try require(info.Mode().IsRegular(), "{strconv::Quote(relative)} is not a regular file")
+    Result::ok(self.entry(relative, info))
+  }
+
+  // Emits matching regular files as they are discovered. The caller owns and
+  // closes output.
+  fn walk(pattern: Str, ignores: [Str], output: Sender<Entry>) Void!Error {
+    try validate_patterns(pattern, ignores)
+    iofs::WalkDir(
+      self.root.FS(),
+      ".",
+      fn(path: Str, item: iofs::DirEntry, walk_error: Error) Void!Error {
+        match unsafe::is_nil(walk_error) {
+          false => Result::err(walk_error),
+          true => self.visit(pattern, ignores, output, filepath::ToSlash(path), item),
+        }
+      },
+    )
+  }
+
+  // Reads a file only if its size and mtime still match the walked metadata,
+  // then verifies those values again after reading.
+  fn read_and_hash(entry: Entry) ReadResult!Error {
+    let file = try self.root.Open(filepath::FromSlash(entry.relative_path))
+    defer file.Close()
+    try require(unchanged(try file.Stat(), entry), "file changed before read: {entry.relative_path}")
+    let body = try io::ReadAll(io::LimitReader(file, Int64::from(entry.size_bytes) + 1))
+    try require(body.size() == entry.size_bytes, "file changed during read: {entry.relative_path}")
+    try require(unchanged(try file.Stat(), entry), "file changed during read: {entry.relative_path}")
+
+    let hasher = sha256::New()
+    hasher.Write(body)
+    let source = Str::from(body)
+    let extracted = markdown::parse(source, entry.relative_path)
+    Result::ok(
+      ReadResult{
+        relative_path: entry.relative_path,
+        title: extracted.title,
+        hash: hex::EncodeToString(hasher.Sum([])),
+        markdown: source,
+        searchable_text: extracted.searchable_text,
+        size_bytes: entry.size_bytes,
+        mtime_ns: entry.mtime_ns,
+      },
+    )
+  }
+
+  // Patterns were validated before the walk started.
+  private fn visit(
+    pattern: Str,
+    ignores: [Str],
+    output: Sender<Entry>,
+    relative: Str,
+    item: iofs::DirEntry,
+  ) Void!Error {
+    if relative == "." {
+      Result::ok(())
+    } else if hidden_path(relative) or ignored_path(relative, ignores) {
+      skip(item)
+    } else if item.IsDir() or not item.Type().IsRegular() {
+      // Symlinks and other irregular files are never followed or indexed.
+      Result::ok(())
+    } else if doublestar::MatchUnvalidated(pattern, relative) {
+      output.send(self.entry(relative, try item.Info()))
+      Result::ok(())
+    } else {
+      Result::ok(())
+    }
+  }
+
+  private fn entry(relative: Str, info: iofs::FileInfo) Entry {
+    Entry{
+      root_path: self.root_path,
+      relative_path: relative,
+      absolute_path: filepath::Join(self.root_path, filepath::FromSlash(relative)),
+      size_bytes: Int::fit(info.Size()),
+      mtime_ns: Int::fit(info.ModTime().UnixNano()),
+    }
+  }
+}
+
+// Bounds the bytes retained by reader and writer stages.
+struct ByteBudget {
+  lock: &mut sync::Mutex,
+  ready: &mut sync::Cond,
+  limit: Int,
+  used: Int,
+  peak: Int,
+  invalid: Bool,
+}
+
+// Creates a positive byte budget.
+fn new_byte_budget(limit: Int) (&mut ByteBudget)!Error {
+  try require(limit > 0, "byte budget must be positive")
+  let lock = &mut sync::Mutex{}
+  Result::ok(
+    &mut ByteBudget{
+      lock: lock,
+      ready: sync::NewCond(lock),
+      limit: limit,
+      used: 0,
+      peak: 0,
+      invalid: false,
+    },
+  )
+}
+
+impl ByteBudget {
+  // Waits until the complete reservation fits.
+  fn mut reserve(bytes: Int) Int!Error {
+    try require(bytes >= 0, "cannot reserve negative bytes")
+    try require(bytes <= self.limit, "file size {bytes} exceeds byte budget {self.limit}")
+    self.lock.Lock()
+    defer self.lock.Unlock()
+    while self.used + bytes > self.limit {
+      self.ready.Wait()
+    }
+    self.used =+ bytes
+    if self.used > self.peak {
+      self.peak = self.used
+    }
+    Result::ok(bytes)
+  }
+
+  // Returns a prior reservation and rejects accounting underflow.
+  fn mut release(bytes: Int) Void!Error {
+    self.lock.Lock()
+    defer self.lock.Unlock()
+    if bytes < 0 or bytes > self.used {
+      self.invalid = true
+      Result::err(Error::new("invalid byte-budget release {bytes} with {self.used} reserved"))
+    } else {
+      self.used =- bytes
+      self.ready.Broadcast()
+      Result::ok(())
+    }
+  }
+
+  // The greatest number of simultaneously reserved bytes.
+  fn mut peak_bytes() Int {
+    self.lock.Lock()
+    defer self.lock.Unlock()
+    self.peak
+  }
+
+  // Bytes currently reserved.
+  fn mut used_bytes() Int {
+    self.lock.Lock()
+    defer self.lock.Unlock()
+    self.used
+  }
+
+  // Whether every release respected reservation accounting.
+  fn mut healthy() Bool {
+    self.lock.Lock()
+    defer self.lock.Unlock()
+    not self.invalid
+  }
+}
+
+private fn require(condition: Bool, message: Str) Void!Error {
+  match condition {
+    true => Result::ok(()),
+    false => Result::err(Error::new(message)),
+  }
+}
+
+private fn validate_pattern(pattern: Str) Void!Error {
+  require(doublestar::ValidatePattern(pattern), "invalid glob pattern {strconv::Quote(pattern)}")
+}
+
+private fn hidden_path(relative: Str) Bool {
+  mut hidden = false
+  for part in strings::Split(relative, "/") {
+    if strings::HasPrefix(part, ".") {
+      hidden = true
+    }
+  }
+  hidden
+}
+
+private fn ignored_path(relative: Str, ignores: [Str]) Bool {
+  mut ignored = false
+  for pattern in ignores {
+    if doublestar::MatchUnvalidated(pattern, relative) {
+      ignored = true
+    }
+  }
+  ignored
+}
+
+// Skips a whole directory, or just the file.
+private fn skip(item: iofs::DirEntry) Void!Error {
+  match item.IsDir() {
+    true => Result::err(filepath::SkipDir),
+    false => Result::ok(()),
+  }
+}
+
+private fn unchanged(info: iofs::FileInfo, entry: Entry) Bool {
+  info.Mode().IsRegular() and Int::fit(info.Size()) == entry.size_bytes and Int::fit(info.ModTime().UnixNano()) == entry.mtime_ns
+}
+
+private fn error_message(error: Error) Str {
+  error.error()
+}
+
+private fn failure(result: Void!Error) Str {
+  match result {
+    ok => "",
+    err(error) => error.error(),
+  }
+}
+
+test fn canonical_directories_must_be_directories() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-canonical-").map_err(error_message)
+  defer os::RemoveAll(root)
+  try write_file(root, "nested/doc.md", "doc")
+  let canonical = try canonical_directory(filepath::Join(root, "nested", "..")).map_err(error_message)
+  try testing::assert(
+    canonical == (try filepath::EvalSymlinks(root).map_err(error_message)),
+    "expected a clean, resolved root",
+  )
+  let file = filepath::Join(root, "nested", "doc.md")
+  try testing::assert(
+    failure(canonical_directory(file).map(fn(_: Str) {})) == "{strconv::Quote(file)} is not a directory",
+    "expected a file to be rejected",
+  )
+  let scanner = try open_scanner(root).map_err(error_message)
+  defer scanner.close()
+  testing::assert(
+    failure(scanner.inspect("nested").map(fn(_: Entry) {})) == "\"nested\" is not a regular file",
+    "expected a directory entry to be rejected",
+  )
+}
+
+private fn write_file(root: Str, relative: Str, body: Str) Void!Str {
+  let path = filepath::Join(root, relative)
+  try os::MkdirAll(filepath::Dir(path), 493).map_err(error_message)
+  os::WriteFile(path, &mut body.bytes(), 420).map_err(error_message)
+}
+
+// Paths in walk order, which is lexical.
+private fn walk_paths(root: Str, pattern: Str, ignores: [Str]) [Str]!Str {
+  let scanner = try open_scanner(root).map_err(error_message)
+  defer scanner.close()
+  let entries = Chan::new<Entry>(1)
+  let done = Chan::new<Str>(1)
+  async::start(fn() {
+    let message = match scanner.walk(pattern, ignores, entries.sender()) {
+      ok => "",
+      err(error) => error.error(),
+    }
+    entries.sender().close()
+    done.send(message)
+  })
+  let paths: &mut [Str] = &mut []
+  mut reading = true
+  while reading {
+    match entries.receiver().recv() {
+      entry => paths.push(entry.relative_path),
+      _ => { reading = false },
+    }
+  }
+  let message = done.recv().expect("walk reports completion")
+  try testing::assert(message.is_empty(), message)
+  Result::ok(paths.*)
+}
+
+test fn walk_streams_matching_files() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-walk-").map_err(error_message)
+  defer os::RemoveAll(root)
+  try write_file(root, "root.md", "root")
+  try write_file(root, "nested/child.md", "child")
+  try write_file(root, "nested/skip.md", "skip")
+  try write_file(root, "nested/text.txt", "text")
+  try write_file(root, ".hidden/secret.md", "secret")
+  if runtime::GOOS != "windows" {
+    try os::Symlink(filepath::Join(root, "nested"), filepath::Join(root, "linked")).map_err(error_message)
+    try os::Symlink(
+      filepath::Join(root, "root.md"),
+      filepath::Join(root, "alias.md"),
+    ).map_err(error_message)
+  }
+  let paths = try walk_paths(root, "**/*.md", ["**/skip.md"])
+  let listed = strings::Join(paths, ", ")
+  testing::assert(listed == "nested/child.md, root.md", "unexpected walk results: {listed}")
+}
+
+test fn walk_prunes_exactly_ignored_directory() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-ignore-").map_err(error_message)
+  defer os::RemoveAll(root)
+  try write_file(root, "archive/hidden.md", "hidden")
+  let paths = try walk_paths(root, "**/*.md", ["archive"])
+  testing::assert(paths.size() == 0, "ignored directory emitted {strings::Join(paths, ", ")}")
+}
+
+test fn walk_rejects_invalid_patterns() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-patterns-").map_err(error_message)
+  defer os::RemoveAll(root)
+  try testing::assert(validate_patterns("**/*.md", ["archive/**"]).is_ok(), "expected valid patterns")
+  try testing::assert(
+    failure(validate_patterns("[", [])) == "invalid glob pattern \"[\"",
+    "expected invalid include pattern",
+  )
+  try testing::assert(validate_patterns("**/*.md", ["["]).is_err(), "expected invalid ignore pattern")
+  testing::assert(walk_paths(root, "**/*.md", ["["]).is_err(), "walk must validate patterns")
+}
+
+test fn read_and_hash_rejects_changed_metadata() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-changed-").map_err(error_message)
+  defer os::RemoveAll(root)
+  try write_file(root, "doc.md", "first")
+  let scanner = try open_scanner(root).map_err(error_message)
+  defer scanner.close()
+  let entry = try scanner.inspect("doc.md").map_err(error_message)
+  let result = try scanner.read_and_hash(entry).map_err(error_message)
+  try testing::assert(
+    result.markdown == "first" and result.hash == "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
+    "unexpected read: {result.hash}",
+  )
+  let info = try os::Stat(entry.absolute_path).map_err(error_message)
+  let changed = info.ModTime().Add(time::Second)
+  try os::Chtimes(entry.absolute_path, changed, changed).map_err(error_message)
+  let changed_read = match scanner.read_and_hash(entry) {
+    ok(_) => "",
+    err(error) => error.error(),
+  }
+  testing::assert(
+    changed_read == "file changed before read: doc.md",
+    "expected changed metadata to be rejected",
+  )
+}
+
+test fn read_and_hash_rejects_replacement_escaping_root() Void!Str {
+  // Symlink replacement requires Windows symlink privileges.
+  match runtime::GOOS == "windows" {
+    true => testing::pass(),
+    false => {
+      let root = try os::MkdirTemp("", "kb-files-escape-root-").map_err(error_message)
+      defer os::RemoveAll(root)
+      let outside = try os::MkdirTemp("", "kb-files-escape-outside-").map_err(error_message)
+      defer os::RemoveAll(outside)
+      try write_file(root, "doc.md", "inside")
+      let scanner = try open_scanner(root).map_err(error_message)
+      defer scanner.close()
+      let entry = try scanner.inspect("doc.md").map_err(error_message)
+      try os::Remove(entry.absolute_path).map_err(error_message)
+      try write_file(outside, "doc.md", "outside")
+      try os::Symlink(filepath::Join(outside, "doc.md"), entry.absolute_path).map_err(error_message)
+      testing::assert(
+        scanner.read_and_hash(entry).is_err(),
+        "expected escaping symlink replacement to be rejected",
+      )
+    },
+  }
+}
+
+test fn scanner_pins_root_across_rename() Void!Str {
+  // Root replacement requires Windows symlink privileges.
+  match runtime::GOOS == "windows" {
+    true => testing::pass(),
+    false => {
+      let parent = try os::MkdirTemp("", "kb-files-pinned-").map_err(error_message)
+      defer os::RemoveAll(parent)
+      let root = filepath::Join(parent, "root")
+      let outside = filepath::Join(parent, "outside")
+      try write_file(root, "doc.md", "inside")
+      let scanner = try open_scanner(root).map_err(error_message)
+      defer scanner.close()
+      let entry = try scanner.inspect("doc.md").map_err(error_message)
+      try os::Rename(root, filepath::Join(parent, "moved")).map_err(error_message)
+      try write_file(outside, "doc.md", "outside")
+      try os::Symlink(outside, root).map_err(error_message)
+      let result = try scanner.read_and_hash(entry).map_err(error_message)
+      testing::assert(
+        result.markdown == "inside",
+        "scanner followed replaced root: {result.markdown}",
+      )
+    },
+  }
+}
+
+test fn unicode_paths_and_nanosecond_mtimes_round_trip() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-unicode-").map_err(error_message)
+  defer os::RemoveAll(root)
+  let relative = filepath::Join("日本語", "naïve 🧠.md")
+  let path = filepath::Join(root, relative)
+  try write_file(root, relative, "unicode body")
+  let requested = time::Unix(1_700_000_000, 123_456_789)
+  try os::Chtimes(path, requested, requested).map_err(error_message)
+  let info = try os::Stat(path).map_err(error_message)
+  // Skip on filesystems that round nanosecond mtimes.
+  match info.ModTime().UnixNano() == requested.UnixNano() {
+    false => testing::pass(),
+    true => {
+      let scanner = try open_scanner(root).map_err(error_message)
+      defer scanner.close()
+      let entry = try scanner.inspect(relative).map_err(error_message)
+      try testing::assert(
+        entry.relative_path == filepath::ToSlash(relative),
+        "Unicode path changed: {entry.relative_path}",
+      )
+      try testing::assert(
+        entry.mtime_ns == Int::fit(requested.UnixNano()),
+        "nanosecond mtime changed: {entry.mtime_ns}",
+      )
+      let result = try scanner.read_and_hash(entry).map_err(error_message)
+      try testing::assert(
+        result.relative_path == filepath::ToSlash(relative) and result.markdown == "unicode body",
+        "unexpected Unicode read result",
+      )
+      let changed = info.ModTime().Add(time::Millisecond)
+      try os::Chtimes(path, changed, changed).map_err(error_message)
+      let changed_info = try os::Stat(path).map_err(error_message)
+      // Skip on filesystems that drop a subsecond mtime change.
+      match changed_info.ModTime().UnixNano() == info.ModTime().UnixNano() {
+        true => testing::pass(),
+        false => {
+          testing::assert(
+            scanner.read_and_hash(entry).is_err(),
+            "subsecond timestamp change was not detected",
+          )
+        },
+      }
+    },
+  }
+}
+
+test fn read_and_hash_reports_inaccessible_file() Void!Str {
+  let root = try os::MkdirTemp("", "kb-files-private-").map_err(error_message)
+  defer os::RemoveAll(root)
+  try write_file(root, "private.md", "private")
+  let scanner = try open_scanner(root).map_err(error_message)
+  defer scanner.close()
+  let entry = try scanner.inspect("private.md").map_err(error_message)
+  try os::Chmod(entry.absolute_path, 0).map_err(error_message)
+  defer os::Chmod(entry.absolute_path, 384)
+  // Windows and the root user bypass permission bits.
+  let bypassed = runtime::GOOS == "windows" or os::Geteuid() == 0
+  testing::assert(
+    bypassed or scanner.read_and_hash(entry).is_err(),
+    "expected unreadable file to be reported",
+  )
+}
+
+test fn byte_budget_blocks_and_tracks_peak() Void!Str {
+  try testing::assert(new_byte_budget(0).is_err(), "expected positive budget")
+  let budget = try new_byte_budget(10).map_err(error_message)
+  let _ = try budget.reserve(8).map_err(error_message)
+  let reserved = Chan::new<Bool>(1)
+  async::start(fn() {
+    let _ = budget.reserve(4)
+    reserved.send(true)
+  })
+  let blocked = select {
+    reserved.recv() => false,
+    time::After(20 * time::Millisecond).recv() => true,
+  }
+  try testing::assert(blocked, "reservation should block")
+  try budget.release(8).map_err(error_message)
+  let woke = select {
+    reserved.recv() => true,
+    time::After(time::Second).recv() => false,
+  }
+  try testing::assert(woke, "reservation did not wake")
+  try testing::assert(budget.peak_bytes() <= 10, "peak exceeded limit: {budget.peak_bytes()}")
+  try testing::assert(budget.used_bytes() == 4, "expected four reserved bytes")
+  try testing::assert(budget.reserve(11).is_err(), "expected oversized reservation error")
+  try testing::assert(budget.reserve(-1).is_err(), "expected negative reservation error")
+  testing::assert(
+    budget.release(5).is_err() and not budget.healthy(),
+    "expected invalid release to poison accounting health",
+  )
+}
