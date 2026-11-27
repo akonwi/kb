@@ -1,21 +1,17 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
-	"io"
 	"strings"
 )
 
 const configVersion = 1
 
 type ConfigFile struct {
-	Version            int                `json:"version"`
-	Collections        []ConfigCollection `json:"collections"`
-	CollectionsPresent bool               `json:"-"`
+	Version     int                `json:"version"`
+	Collections []ConfigCollection `json:"collections"`
 }
 
 type ConfigCollection struct {
@@ -72,25 +68,6 @@ func (db *DB) ExportConfigJSON() (string, error) {
 		return "", err
 	}
 	return string(encoded) + "\n", nil
-}
-
-// DecodeConfigJSON strictly decodes one configuration document. Validation and
-// normalization are owned by the Ard configuration layer.
-func DecodeConfigJSON(data string) (ConfigFile, error) {
-	decoder := json.NewDecoder(bytes.NewBufferString(data))
-	decoder.DisallowUnknownFields()
-	var config ConfigFile
-	if err := decoder.Decode(&config); err != nil {
-		return ConfigFile{}, fmt.Errorf("decode config: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return ConfigFile{}, fmt.Errorf("decode config: trailing JSON value")
-		}
-		return ConfigFile{}, fmt.Errorf("decode config: %w", err)
-	}
-	config.CollectionsPresent = config.Collections != nil
-	return config, nil
 }
 
 // ImportConfig atomically upserts validated collections and replaces contexts
