@@ -1,5 +1,8 @@
 use ard/testing
 
+use go:encoding/json
+use go:errors
+use go:io
 use kb/collections
 use go:kb/ffi/sqlite
 use kb/files
@@ -25,19 +28,64 @@ fn validation_error(message: Str) Error {
   Error::new(message)
 }
 
-fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
+// The JSON document read by `kb config import`. `collections` is a Maybe so
+// that a missing or null array is rejected while `[]` is a valid snapshot.
+private struct ConfigDocument {
+  version: Int,
+  collections: [ConfigEntry]?,
+}
+
+private struct ConfigEntry {
+  name: Str,
+  root_path: Str,
+  glob_pattern: Str,
+  ignore_patterns: [Str],
+  contexts: [ConfigContextEntry],
+}
+
+private struct ConfigContextEntry {
+  path_prefix: Str,
+  description: Str,
+}
+
+// Receives whatever follows the configuration document, which must be nothing.
+private struct TrailingValue {}
+
+private fn decode_error(error: Error) Error {
+  Error::new("decode config: {error.error()}")
+}
+
+// Strictly decodes exactly one configuration document: unknown fields are
+// rejected at every level, including inside `collections`.
+private fn decode_config(content: Str) ConfigDocument!Error {
+  let decoder = json::NewDecoder(strings::NewReader(content))
+  decoder.DisallowUnknownFields()
+  mut document = ConfigDocument{version: 0, collections: Maybe::new()}
+  try decoder.Decode(&mut document).map_err(decode_error)
+  mut trailing = TrailingValue{}
+  match decoder.Decode(&mut trailing) {
+    ok => Result::err(Error::new("decode config: trailing JSON value")),
+    err(error) => {
+      match errors::Is(error, io::EOF) {
+        true => Result::ok(document),
+        false => Result::err(decode_error(error)),
+      }
+    },
+  }
+}
+
+private fn validate_config(source: ConfigDocument) sqlite::ConfigFile!Error {
   try testing::assert(
-    source.Version == 1,
-    "unsupported config version {source.Version}",
+    source.version == 1,
+    "unsupported config version {source.version}",
   ).map_err(validation_error)
-  try testing::assert(
-    source.CollectionsPresent,
-    "config collections must be an explicit JSON array",
-  ).map_err(validation_error)
+  let entries = try source.collections -> _ {
+    Result::err(validation_error("config collections must be an explicit JSON array"))
+  }
   let names: &mut [Str] = &mut []
   let validated: &mut [sqlite::ConfigCollection] = &mut []
-  for item in source.Collections {
-    let name = try collections::normalize_name(item.Name)
+  for item in entries {
+    let name = try collections::normalize_name(item.name)
     let name_key = strings::ToLower(name)
     try testing::assert(
       not contains(names.*, name_key),
@@ -45,27 +93,27 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
     ).map_err(validation_error)
     names.push(name_key)
     try testing::assert(
-      not item.RootPath.is_empty(),
+      not item.root_path.is_empty(),
       "collection {name} root_path is required",
     ).map_err(validation_error)
-    let root = try files::canonical_directory(item.RootPath)
+    let root = try files::canonical_directory(item.root_path)
     try testing::assert(
-      not item.GlobPattern.is_empty(),
+      not item.glob_pattern.is_empty(),
       "collection {name} has an empty glob",
     ).map_err(validation_error)
     let ignores: &mut [Str] = &mut []
-    for pattern in item.IgnorePatterns {
+    for pattern in item.ignore_patterns {
       try testing::assert(
         not pattern.is_empty(),
         "collection {name} has an empty ignore pattern",
       ).map_err(validation_error)
       ignores.push(pattern)
     }
-    try files::validate_patterns(item.GlobPattern, ignores.*)
+    try files::validate_patterns(item.glob_pattern, ignores.*)
     let prefixes: &mut [Str] = &mut []
     let contexts: &mut [sqlite::ConfigContext] = &mut []
-    for context in item.Contexts {
-      let prefix = strings::Trim(strings::TrimSpace(context.PathPrefix), "/")
+    for context in item.contexts {
+      let prefix = strings::Trim(strings::TrimSpace(context.path_prefix), "/")
       try testing::assert(
         not prefix == "." or prefix == ".." or strings::HasPrefix(prefix, "../") or strings::Contains(prefix, "/../"),
         "collection {name} has invalid context prefix {prefix}",
@@ -75,29 +123,23 @@ fn validate_config(source: sqlite::ConfigFile) sqlite::ConfigFile!Error {
         "collection {name} has duplicate context prefix {prefix}",
       ).map_err(validation_error)
       prefixes.push(prefix)
-      contexts.push(sqlite::ConfigContext{PathPrefix: prefix, Description: context.Description})
+      contexts.push(sqlite::ConfigContext{PathPrefix: prefix, Description: context.description})
     }
     validated.push(
       sqlite::ConfigCollection{
         Name: name,
         RootPath: root,
-        GlobPattern: item.GlobPattern,
+        GlobPattern: item.glob_pattern,
         IgnorePatterns: ignores.*,
         Contexts: contexts.*,
       },
     )
   }
-  Result::ok(
-    sqlite::ConfigFile{
-      Version: source.Version,
-      Collections: validated.*,
-      CollectionsPresent: true,
-    },
-  )
+  Result::ok(sqlite::ConfigFile{Version: source.version, Collections: validated.*})
 }
 
 fn import_config(database: store::Store, content: Str, replace: Bool) Int!Error {
-  let decoded = try sqlite::DecodeConfigJSON(content)
+  let decoded = try decode_config(content)
   database.db.ImportConfig(try validate_config(decoded), replace)
 }
 
@@ -186,5 +228,50 @@ test fn exports_and_atomically_imports_collection_configuration() Void!Str {
     (try target.collections().map_err(error_message)).size() == 0,
     "expected replacement removal",
   )
+  testing::pass()
+}
+
+private fn decode_failure(content: Str) Str {
+  match decode_config(content) {
+    ok => "decoded",
+    err(error) => error.error(),
+  }
+}
+
+test fn strictly_decodes_one_configuration_document() Void!Str {
+  let empty = try decode_config("{{\"version\":1,\"collections\":[]}}").map_err(error_message)
+  try testing::assert(
+    empty.collections.is_some() and empty.collections.or([]).size() == 0,
+    "an empty collections array is present",
+  )
+  let missing = try decode_config("{{\"version\":1}}").map_err(error_message)
+  try testing::assert(missing.collections.is_none(), "missing collections are absent")
+  let null = try decode_config("{{\"version\":1,\"collections\":null}}").map_err(error_message)
+  try testing::assert(null.collections.is_none(), "null collections are absent")
+
+  let nested = decode_failure("{{\"version\":1,\"collections\":[{{\"name\":\"a\",\"bogus\":1}}]}}")
+  try testing::assert(
+    nested == "decode config: json: unknown field \"bogus\"",
+    "expected unknown collection field rejection, got {nested}",
+  )
+  let context = decode_failure(
+    "{{\"version\":1,\"collections\":[{{\"name\":\"a\",\"contexts\":[{{\"path_prefix\":\"x\",\"bogus\":1}}]}}]}}",
+  )
+  try testing::assert(
+    context == "decode config: json: unknown field \"bogus\"",
+    "expected unknown context field rejection, got {context}",
+  )
+  let trailing = decode_failure("{{\"version\":1,\"collections\":[]}} {{}}")
+  try testing::assert(
+    trailing == "decode config: trailing JSON value",
+    "expected trailing value rejection, got {trailing}",
+  )
+  let garbage = decode_failure("{{\"version\":1,\"collections\":[]}} x")
+  try testing::assert(
+    garbage == "decode config: invalid character 'x' looking for beginning of value",
+    "expected trailing syntax error, got {garbage}",
+  )
+  let blank = decode_failure("")
+  try testing::assert(blank == "decode config: EOF", "expected empty input rejection, got {blank}")
   testing::pass()
 }
